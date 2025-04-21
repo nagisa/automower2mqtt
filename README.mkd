@@ -1,0 +1,13 @@
+<div align="center">
+    <h1>automower2mqtt</h1>
+    <strong>A basic MQTT gateway for the Husqvarna Automower® Cloud API</strong>
+</div>
+
+Husqvarna Automower®, unfortunately, does not provide a local API, even though the device is
+capable of connecting to WiFi. This tool provides a basic homie-compliant(ish) MQTT proxy between
+the API and your home control things, so you don't have to bake in the API logic into your home
+automation system.
+
+> [!NOTE]
+> The implementation currently exposes only a basic read-only view of the device. Ability to
+> control the Automower is a future extension.
