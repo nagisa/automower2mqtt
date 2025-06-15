@@ -321,6 +321,7 @@ impl Context {
             headers.insert("authorization", format!("Bearer {token}").parse().unwrap());
             headers.insert("authorization-provider", "husqvarna".parse().unwrap());
             let (mut stream, _response) = tokio_tungstenite::connect_async(request).await.unwrap();
+            debug!(response = ?_response, "connected");
             let mut ping_timer = tokio::time::interval(Duration::from_secs(10));
             loop {
                 tokio::select! {
