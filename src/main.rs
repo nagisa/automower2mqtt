@@ -348,6 +348,7 @@ impl Context {
                                 continue;
                             },
                             Ok(tungstenite::Message::Close(_)) => continue 'reconnect,
+                            Err(tungstenite::Error::Protocol(_)) => continue 'reconnect,
                             Ok(tungstenite::Message::Frame(_)) => unreachable!(),
                             Err(err) => return Err(Error::Websocket(err)),
                         };
@@ -466,7 +467,10 @@ impl Context {
                                 };
                             }
                         }
-                        this.monitor().await
+                        let result = this.monitor().await;
+                        // FIXME: properly propagate error upwards.
+                        tracing::error!(error = &result.unwrap_err() as &dyn std::error::Error);
+                        std::process::exit(1);
                     });
                 }
                 Event::Incoming(Packet::Publish(_publish)) => {
