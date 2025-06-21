@@ -127,6 +127,10 @@ enum Error {
     ),
     #[error("an error in websocket")]
     Websocket(#[source] tungstenite::Error),
+    #[error("could not join the monitor thread")]
+    MonitorJoin(#[source] tokio::task::JoinError),
+    #[error("disconnected from the MQTT server")]
+    MqttDisconnect,
 }
 
 fn main() {
@@ -310,9 +314,12 @@ impl Context {
         Ok(result)
     }
 
-    async fn monitor(self: Arc<Self>) -> Result<(), Error> {
+    async fn monitor(self: Arc<Self>) -> Error {
         'reconnect: loop {
-            let token = self.get_token().await?;
+            let token = match self.get_token().await {
+                Ok(t) => t,
+                Err(e) => break 'reconnect e,
+            };
             let mut request = format!("wss://ws.openapi.husqvarna.dev/v1")
                 .into_client_request()
                 .expect("TODO");
@@ -350,7 +357,7 @@ impl Context {
                             Ok(tungstenite::Message::Close(_)) => continue 'reconnect,
                             Err(tungstenite::Error::Protocol(_)) => continue 'reconnect,
                             Ok(tungstenite::Message::Frame(_)) => unreachable!(),
-                            Err(err) => return Err(Error::Websocket(err)),
+                            Err(err) => break 'reconnect Error::Websocket(err),
                         };
                         let event = match message {
                             Ok(event) => event,
@@ -378,7 +385,9 @@ impl Context {
                             warn!(id, "received event for mower we don't know about, consider restarting?");
                             continue;
                         };
-                        mower.record_event(event).await?;
+                        if let Err(e) = mower.record_event(event).await {
+                            break 'reconnect e;
+                        }
                     },
                     _ = ping_timer.tick() => {
                         debug!("sending ping");
@@ -445,47 +454,52 @@ impl Context {
     }
 
     async fn run(self: Arc<Self>, mut mqtt_loop: rumqttc::v5::EventLoop) -> Result<(), Error> {
+        let mut handle = None;
         loop {
             use rumqttc::Outgoing;
             use rumqttc::v5::Event;
             use rumqttc::v5::mqttbytes::v5::Packet;
-            // TODO: reconnections should be handled correctly, also errors...
-            let result = mqtt_loop.poll().await;
+
+            let result = tokio::select! {
+                r = mqtt_loop.poll() => r,
+                join_result = async { handle.as_mut().unwrap().await }, if handle.is_some() => {
+                    match join_result {
+                        Ok(error) => return Err(error),
+                        Err(join_error) => return Err(Error::MonitorJoin(join_error)),
+                    }
+                }
+            };
             match result.map_err(Error::MqttConnection)? {
                 Event::Incoming(Packet::ConnAck(_)) => {
-                    tracing::info!("connected to mqtt");
+                    tracing::debug!("connected to mqtt");
                     let this = Arc::clone(&self);
-                    tokio::spawn(async move {
+                    let joiner = tokio::spawn(async move {
                         if let Err(e) = this.publish_root_device().await {
-                            todo!("error handling somehow: {e:?}");
+                            return e;
                         }
                         {
                             let state = this.state.lock().await;
                             for mower in state.mowers.values() {
                                 if let Err(e) = mower.publish_device().await {
-                                    todo!("error handling somehow: {e:?}");
+                                    return e;
                                 };
                             }
                         }
-                        let result = this.monitor().await;
-                        // FIXME: properly propagate error upwards.
-                        tracing::error!(error = &result.unwrap_err() as &dyn std::error::Error);
-                        std::process::exit(1);
+                        this.monitor().await
                     });
+                    handle = Some(joiner);
                 }
                 Event::Incoming(Packet::Publish(_publish)) => {
                     todo!("incoming publish");
                 }
                 Event::Outgoing(Outgoing::Disconnect) => {
-                    tracing::error!("disconnected from mqtt, wrapping up");
-                    break;
+                    return Err(Error::MqttDisconnect);
                 }
                 event @ Event::Incoming(_) | event @ Event::Outgoing(_) => {
                     tracing::trace!(?event, "not handled in any way");
                 }
             }
         }
-        Ok(())
     }
 }
 
