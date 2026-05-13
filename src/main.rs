@@ -10,10 +10,11 @@ use homie5::device_description::PropertyDescriptionBuilder;
 use homie5::{Homie5DeviceProtocol, HomieDeviceStatus, HomieID};
 use rumqttc::v5::MqttOptions;
 use rumqttc::v5::mqttbytes::v5::LastWill;
+use rumqttc::v5::mqttbytes::v5::Publish;
 use schemas::automower::MowerData;
 use std::collections::BTreeMap;
 use std::collections::btree_map;
-use std::error::Error as _;
+use std::str::Utf8Error;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -130,6 +131,12 @@ enum Error {
     MonitorJoin(#[source] tokio::task::JoinError),
     #[error("disconnected from the MQTT server")]
     MqttDisconnect,
+    #[error("received MQTT message {1:?} with a non-utf8 topic; this should never happen")]
+    NonUtf8Topic(#[source] Utf8Error, Publish),
+    #[error("received an invalid MQTT command {1:?}")]
+    InvalidCommand(homie5::Homie5ProtocolError, Publish),
+    #[error("received an unexpected MQTT command {0:?}")]
+    UnexpectedMqttCommand(Publish),
 }
 
 fn main() {
@@ -137,15 +144,19 @@ fn main() {
     std::process::exit(match setup_and_run(args) {
         Ok(_) => 0,
         Err(e) => {
-            eprintln!("error: {e}");
-            let mut cause = e.source();
-            while let Some(e) = cause {
-                eprintln!("  because: {e}");
-                cause = e.source();
-            }
+            print_error(&e);
             1
         }
     });
+}
+
+fn print_error(e: &dyn std::error::Error) {
+    eprintln!("error: {e}");
+    let mut cause = e.source();
+    while let Some(e) = cause {
+        eprintln!("  because: {e}");
+        cause = e.source();
+    }
 }
 
 fn setup_and_run(args: Args) -> Result<(), Error> {
@@ -274,7 +285,7 @@ impl Context {
         state.token_expiration = boot_time::Instant::now()
             .checked_add(token_duration)
             .expect("TODO");
-        return Ok(Arc::clone(&state.token));
+        Ok(Arc::clone(&state.token))
     }
 
     async fn update_mower_data(&self) -> Result<Vec<MowerContext>, Error> {
@@ -319,7 +330,7 @@ impl Context {
                 Ok(t) => t,
                 Err(e) => break 'reconnect e,
             };
-            let mut request = format!("wss://ws.openapi.husqvarna.dev/v1")
+            let mut request = "wss://ws.openapi.husqvarna.dev/v1"
                 .into_client_request()
                 .expect("TODO");
             let headers = request.headers_mut();
@@ -461,7 +472,7 @@ impl Context {
     }
 
     async fn run(self: Arc<Self>, mut mqtt_loop: rumqttc::v5::EventLoop) -> Result<(), Error> {
-        let mut handle = None;
+        let mut monitor_handle = None;
         loop {
             use rumqttc::Outgoing;
             use rumqttc::v5::Event;
@@ -469,12 +480,12 @@ impl Context {
 
             let result = tokio::select! {
                 r = mqtt_loop.poll() => r,
-                join_result = async { handle.as_mut().unwrap().await }, if handle.is_some() => {
+                join_result = async { monitor_handle.as_mut().unwrap().await }, if monitor_handle.is_some() => {
                     match join_result {
                         Ok(error) => return Err(error),
                         Err(join_error) => return Err(Error::MonitorJoin(join_error)),
                     }
-                }
+                },
             };
             match result.map_err(Error::MqttConnection)? {
                 Event::Incoming(Packet::ConnAck(_)) => {
@@ -494,10 +505,18 @@ impl Context {
                         }
                         this.monitor().await
                     });
-                    handle = Some(joiner);
+                    monitor_handle = Some(joiner);
                 }
-                Event::Incoming(Packet::Publish(_publish)) => {
-                    todo!("incoming publish");
+                Event::Incoming(Packet::Publish(msg)) => {
+                    let this = Arc::clone(&self);
+                    tokio::spawn(async move {
+                        if let Err(e) = this.handle_command(msg).await {
+                            tracing::error!(
+                                error = &e as &dyn std::error::Error,
+                                "error handling mqtt command"
+                            );
+                        }
+                    });
                 }
                 Event::Outgoing(Outgoing::Disconnect) => {
                     return Err(Error::MqttDisconnect);
@@ -508,12 +527,122 @@ impl Context {
             }
         }
     }
+
+    async fn handle_command(&self, msg: Publish) -> Result<(), Error> {
+        let topic = match str::from_utf8(&msg.topic) {
+            Err(e) => return Err(Error::NonUtf8Topic(e, msg)),
+            Ok(topic) => topic,
+        };
+        let (prop, val) = match homie5::parse_mqtt_message(topic, &msg.payload) {
+            Ok(homie5::Homie5Message::PropertySet {
+                property,
+                set_value,
+            }) => (property, set_value),
+            Err(e) => return Err(Error::InvalidCommand(e, msg)),
+            Ok(_) => return Err(Error::UnexpectedMqttCommand(msg)),
+        };
+        let state = self.state.lock().await;
+        let device_id = prop.device_id().as_str();
+        let node_id = prop.node_id();
+        let prop_id = prop.prop_id();
+        let Some(mower) = state.mowers.get(device_id) else {
+            tracing::warn!(%device_id, "command for an unknown mower");
+            return Ok(());
+        };
+        let Some(prop_description) = mower.description.get_property(prop.prop_pointer()) else {
+            tracing::error!(%node_id, %prop_id, "command for an unknown property");
+            return Ok(());
+        };
+        let mower_id = MowerContext::key_to_id(device_id, &self.protocol);
+        if !prop_description.settable {
+            tracing::error!(%node_id, %prop_id, "property not settable");
+            return Ok(());
+        }
+        drop(state);
+        match (node_id.as_str(), prop_id.as_str()) {
+            ("settings", "cutting-height") => {
+                let Ok(height) = val.parse::<i64>() else {
+                    tracing::error!(%node_id, %prop_id, %val, "cutting height value is not a number");
+                    return Ok(());
+                };
+                return self
+                    .set_setting(
+                        mower_id,
+                        serde_json::json!({ "data": {
+                            "type": "settings",
+                            "attributes": { "cuttingHeight": height }
+                        }}),
+                    )
+                    .await;
+            }
+            ("settings", "headlight-mode") => {
+                return self
+                    .set_setting(
+                        mower_id,
+                        serde_json::json!({ "data": {
+                            "type": "settings",
+                            "attributes": { "headlight": { "mode": val } }
+                        }}),
+                    )
+                    .await;
+            }
+            (_, _) => {
+                unreachable!()
+            }
+        }
+    }
+
+    async fn set_setting(&self, mower_id: &str, json: serde_json::Value) -> Result<(), Error> {
+        let token = self.get_token().await?;
+        let response = self
+            .client
+            .post(format!(
+                "{AUTOMOWER_CONNECT_API_BASE}/mowers/{mower_id}/settings"
+            ))
+            .header("accept", "application/vnd.api+json")
+            .header("content-type", "application/vnd.api+json")
+            .header("x-api-key", &self.app_key)
+            .header("authorization", format!("Bearer {token}"))
+            .header("authorization-provider", "husqvarna")
+            .json(&json)
+            .send()
+            .await
+            .map_err(|e| Error::GetApi(e, "POST /mowers/{mower_id}/settings"))?;
+        let code = response.status();
+        if !code.is_success() {
+            let response = response
+                .text()
+                .await
+                .map_err(|e| Error::ReadResponse(e, "POST /mowers/{mower_id}/settings"))?;
+            tracing::error!(
+                ?response,
+                uri = "/mowers/{mower_id}/settings",
+                method = "POST"
+            );
+        } else {
+            let response = response
+                .json::<serde_json::Value>()
+                .await
+                .map_err(|e| Error::ReadResponse(e, "POST /mowers/{mower_id}/settings"))?;
+            tracing::debug!(
+                ?response,
+                uri = "/mowers/{mower_id}/settings",
+                method = "POST"
+            );
+        }
+        Ok(())
+    }
 }
 
 impl MowerContext {
     fn id_to_key(id: &str, root_protocol: &Homie5DeviceProtocol) -> String {
         let root_id = root_protocol.device_ref().device_id();
         format!("{}-{}", root_id, id)
+    }
+
+    fn key_to_id<'a>(key: &'a str, root_protocol: &Homie5DeviceProtocol) -> &'a str {
+        let root_id = root_protocol.device_ref().device_id();
+        &key[root_id.as_str().len() + 1..]
     }
 
     async fn new(
@@ -634,7 +763,11 @@ impl MowerContext {
                 restricted_reason_prop,
             )
             .build();
-        let cutting_height_prop = PropertyDescriptionBuilder::integer().range(0..=9).build();
+        let cutting_height_prop = PropertyDescriptionBuilder::integer()
+            .unit(HOMIE_UNIT_PERCENT)
+            .range(0..=100)
+            .settable(true)
+            .build();
         let headlight_mode_prop = PropertyDescriptionBuilder::enumeration([
             "ALWAYS_ON",
             "ALWAYS_OFF",
@@ -642,6 +775,7 @@ impl MowerContext {
             "EVENING_AND_NIGHT",
         ])
         .unwrap()
+        .settable(true)
         .build();
         let settings_node = NodeDescriptionBuilder::new()
             .add_property(SETTINGS_HEADLIGHT_PROP_ID.clone(), headlight_mode_prop)
@@ -802,7 +936,7 @@ impl MowerContext {
             }
         };
         for (node_id, prop_id, value) in events {
-            let retained = Self::is_retained(&self, node_id, prop_id);
+            let retained = Self::is_retained(self, node_id, prop_id);
             let p = self
                 .protocol
                 .publish_value(node_id, prop_id, value, retained);
