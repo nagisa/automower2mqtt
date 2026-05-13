@@ -307,6 +307,13 @@ pub(crate) mod websocket {
     }
 
     #[derive(Debug, serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub(crate) struct ConnectionEvent {
+        ready: bool,
+        connection_id: String,
+    }
+
+    #[derive(Debug, serde::Deserialize)]
     #[serde(tag = "type")]
     #[serde(rename_all = "kebab-case")]
     pub(crate) enum Event {

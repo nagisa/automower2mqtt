@@ -338,7 +338,15 @@ impl Context {
                         debug!(websocket_message=?result, "received a websocket message");
                         let message: Result<schemas::websocket::Event ,_> = match result {
                             Ok(tungstenite::Message::Text(text)) => {
-                                serde_json::from_str(&text)
+                                let event = serde_json::from_str(&text);
+                                if event.is_err() {
+                                    let conn_evt: Result<schemas::websocket::ConnectionEvent, _> =
+                                        serde_json::from_str(&text);
+                                    if conn_evt.is_ok() {
+                                        continue;
+                                    }
+                                }
+                                event
                             },
                             Ok(tungstenite::Message::Binary(bytes)) => {
                                 serde_json::from_slice(&bytes)
