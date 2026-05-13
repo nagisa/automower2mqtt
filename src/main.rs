@@ -1,7 +1,6 @@
 use clap::Parser as _;
 use futures::{SinkExt as _, StreamExt as _};
 use homie5::HOMIE_UNIT_PERCENT;
-use homie5::HomieDataType;
 use homie5::client::Publish as HomiePublish;
 use homie5::client::Subscription;
 use homie5::device_description::DeviceDescriptionBuilder;
@@ -528,26 +527,63 @@ impl MowerContext {
             .name(data.system.name.clone())
             .root(root_id.clone())
             .parent(root_id.clone());
-        let battery_level_prop = PropertyDescriptionBuilder::new(HomieDataType::Integer)
+        let battery_level_prop = PropertyDescriptionBuilder::integer()
             .unit(HOMIE_UNIT_PERCENT)
-            .format(0..=100)
+            .range(0..=100)
             .build();
         let battery_node = NodeDescriptionBuilder::new()
             .add_property(BATTERY_LEVEL_PROP_ID.clone(), battery_level_prop)
             .build();
-        let latlon_prop = PropertyDescriptionBuilder::new(HomieDataType::String).build();
+        let latlon_prop = PropertyDescriptionBuilder::string().build();
         let position_node = NodeDescriptionBuilder::new()
             .add_property(POSITION_LATLON_PROP_ID.clone(), latlon_prop)
             .build();
-        // FIXME: specify the format for enums...
-        let mode_prop = PropertyDescriptionBuilder::new(HomieDataType::Enum).build();
-        let activity_prop = PropertyDescriptionBuilder::new(HomieDataType::Enum).build();
-        let inactive_prop = PropertyDescriptionBuilder::new(HomieDataType::Enum).build();
-        let state_prop = PropertyDescriptionBuilder::new(HomieDataType::Enum).build();
-        let error_code_prop = PropertyDescriptionBuilder::new(HomieDataType::Integer)
-            .format(0..=724)
-            .build();
-        let work_area_prop = PropertyDescriptionBuilder::new(HomieDataType::Integer).build();
+        let mode_prop = PropertyDescriptionBuilder::enumeration([
+            "MAIN_AREA",
+            "SECONDARY_AREA",
+            "HOME",
+            "DEMO",
+            "UNKNOWN",
+            "POI",
+        ])
+        .unwrap()
+        .build();
+        let activity_prop = PropertyDescriptionBuilder::enumeration([
+            "UNKNOWN",
+            "NOT_APPLICABLE",
+            "MOWING",
+            "GOING_HOME",
+            "CHARGING",
+            "LEAVING",
+            "PARKED_IN_CS",
+            "STOPPED_IN_GARDEN",
+        ])
+        .unwrap()
+        .build();
+        let inactive_prop = PropertyDescriptionBuilder::enumeration([
+            "NONE",
+            "PLANNING",
+            "SEARCHING_FOR_SATELLITES",
+        ])
+        .unwrap()
+        .build();
+        let state_prop = PropertyDescriptionBuilder::enumeration([
+            "UNKNOWN",
+            "PAUSED",
+            "IN_OPERATION",
+            "WAIT_UPDATING",
+            "WAIT_POWER_UP",
+            "RESTRICTED",
+            "OFF",
+            "STOPPED",
+            "ERROR",
+            "FATAL_ERROR",
+            "ERROR_AT_POWER_UP",
+        ])
+        .unwrap()
+        .build();
+        let error_code_prop = PropertyDescriptionBuilder::integer().range(0..=724).build();
+        let work_area_prop = PropertyDescriptionBuilder::integer().build();
         let mower_node = NodeDescriptionBuilder::new()
             .add_property(MOWER_MODE_PROP_ID.clone(), mode_prop)
             .add_property(MOWER_ACTIVITY_PROP_ID.clone(), activity_prop)
@@ -556,11 +592,27 @@ impl MowerContext {
             .add_property(MOWER_ERROR_CODE_PROP_ID.clone(), error_code_prop)
             .add_property(MOWER_WORK_AREA_ID_PROP_ID.clone(), work_area_prop)
             .build();
-        let restricted_reason_prop = PropertyDescriptionBuilder::new(HomieDataType::Enum).build();
-        let override_prop = PropertyDescriptionBuilder::new(HomieDataType::Enum).build();
-        let next_start_prop = PropertyDescriptionBuilder::new(HomieDataType::Datetime).build();
-        let external_reason_prop = PropertyDescriptionBuilder::new(HomieDataType::Integer)
-            .format(1000..=299_999)
+        let restricted_reason_prop = PropertyDescriptionBuilder::enumeration([
+            "NONE",
+            "WEEK_SCHEDULE",
+            "PARK_OVERRIDE",
+            "SENSOR",
+            "DAILY_LIMIT",
+            "FOTA",
+            "FROST",
+            "ALL_WORK_AREAS_COMPLETED",
+            "EXTERNAL",
+            "WORK_AREA_ABANDONED",
+        ])
+        .unwrap()
+        .build();
+        let override_prop =
+            PropertyDescriptionBuilder::enumeration(["NOT_ACTIVE", "FORCE_PARK", "FORCE_MOW"])
+                .unwrap()
+                .build();
+        let next_start_prop = PropertyDescriptionBuilder::datetime().build();
+        let external_reason_prop = PropertyDescriptionBuilder::integer()
+            .range(1000..=299_999)
             .build();
         let planner_node = NodeDescriptionBuilder::new()
             .add_property(PLANNER_OVERRIDE_PROP_ID.clone(), override_prop)
@@ -574,10 +626,15 @@ impl MowerContext {
                 restricted_reason_prop,
             )
             .build();
-        let cutting_height_prop = PropertyDescriptionBuilder::new(HomieDataType::Integer)
-            .format(0..=9)
-            .build();
-        let headlight_mode_prop = PropertyDescriptionBuilder::new(HomieDataType::Enum).build();
+        let cutting_height_prop = PropertyDescriptionBuilder::integer().range(0..=9).build();
+        let headlight_mode_prop = PropertyDescriptionBuilder::enumeration([
+            "ALWAYS_ON",
+            "ALWAYS_OFF",
+            "EVENING_ONLY",
+            "EVENING_AND_NIGHT",
+        ])
+        .unwrap()
+        .build();
         let settings_node = NodeDescriptionBuilder::new()
             .add_property(SETTINGS_HEADLIGHT_PROP_ID.clone(), headlight_mode_prop)
             .add_property(SETTINGS_CUTTING_HEIGHT_PROP_ID.clone(), cutting_height_prop)

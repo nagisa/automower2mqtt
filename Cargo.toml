@@ -8,7 +8,7 @@ license = "ISC"
 boot-time = "0.1.2"
 clap = { version = "4.5.36", features = ["derive", "env"] }
 futures = "0.3.31"
-homie5 = { git = "https://github.com/schaze/homie5", version = "0.7.0", rev = "6e407a30092905e4f1856cf32fa110bd62b5b7bd" }
+homie5 = { git = "https://github.com/schaze/homie5", version = "0.10.0", rev = "4573c32d4e04e5aea0407f200726768e228ec18e" }
 jiff = { version = "0.2.9", default-features = false, features = ["std"] }
 reqwest = { version = "0.12.15", default-features = false, features = ["http2", "rustls-tls", "stream", "charset", "json"] }
 reqwest-retry = "0.7.0"
