@@ -533,7 +533,7 @@ impl Context {
     }
 
     async fn handle_command(&self, msg: Publish) -> Result<(), Error> {
-        let topic = match str::from_utf8(&msg.topic) {
+        let topic = match std::str::from_utf8(&msg.topic) {
             Err(e) => return Err(Error::NonUtf8Topic(e, msg)),
             Ok(topic) => topic,
         };
