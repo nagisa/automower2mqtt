@@ -895,22 +895,29 @@ impl MowerContext {
             schemas::websocket::Event::MowerEventV2 { attributes: a, .. } => {
                 let mut evts = vec![];
                 let Some(mower) = a.mower else { return Ok(()) };
+                let mut data = self.data.lock().await;
                 if let Some(mode) = mower.mode {
+                    data.mower_mode = mode.clone();
                     evts.push((&MOWER_NODE_ID, &MOWER_MODE_PROP_ID, mode));
                 }
                 if let Some(activity) = mower.activity {
+                    data.mower_activity = activity.clone();
                     evts.push((&MOWER_NODE_ID, &MOWER_ACTIVITY_PROP_ID, activity));
                 }
                 if let Some(reason) = mower.inactive_reason {
+                    data.mower_inactive_reason = Some(reason.clone());
                     evts.push((&MOWER_NODE_ID, &MOWER_INACTIVE_REASON_PROP_ID, reason));
                 }
                 if let Some(state) = mower.state {
+                    data.mower_state = state.clone();
                     evts.push((&MOWER_NODE_ID, &MOWER_STATE_PROP_ID, state));
                 }
                 if let Some(ec) = mower.error_code {
+                    data.error_code = Some(ec);
                     evts.push((&MOWER_NODE_ID, &MOWER_ERROR_CODE_PROP_ID, ec.to_string()));
                 }
                 if let Some(id) = mower.work_area_id {
+                    data.work_area_id = Some(id);
                     evts.push((&MOWER_NODE_ID, &MOWER_WORK_AREA_ID_PROP_ID, id.to_string()));
                 }
                 evts
@@ -920,7 +927,10 @@ impl MowerContext {
                 let Some(planner) = a.planner else {
                     return Ok(());
                 };
+                let mut data = self.data.lock().await;
+
                 if let Some(t) = planner.next_start_timestamp {
+                    data.planner_next_start = t;
                     let dt = if t == 0 {
                         jiff::Timestamp::now().to_string()
                     } else {
@@ -929,12 +939,15 @@ impl MowerContext {
                     evts.push((&PLANNER_NODE_ID, &PLANNER_NEXT_START_PROP_ID, dt));
                 }
                 if let Some(o) = planner.r#override {
+                    data.planner_override = Some(o.action.clone());
                     evts.push((&PLANNER_NODE_ID, &PLANNER_OVERRIDE_PROP_ID, o.action));
                 }
                 if let Some(r) = planner.restricted_reason {
+                    data.planner_restricted_reason = r.clone();
                     evts.push((&PLANNER_NODE_ID, &PLANNER_RESTRICTED_REASON_PROP_ID, r));
                 }
                 if let Some(r) = planner.external_reason {
+                    data.planner_external_reason = Some(r);
                     let r = r.to_string();
                     evts.push((&PLANNER_NODE_ID, &PLANNER_EXTERNAL_REASON_PROP_ID, r));
                 }
