@@ -62,8 +62,8 @@ const USER_AGENT: &str = concat!(
     env!("CARGO_PKG_REPOSITORY"),
     ")"
 );
-const CONNECT_TIMEOUT: Duration = Duration::new(3, 0);
-const API_REQUEST_TIMEOUT: Duration = Duration::new(10, 0);
+const CONNECT_TIMEOUT: Duration = Duration::new(10, 0);
+const API_REQUEST_TIMEOUT: Duration = Duration::new(20, 0);
 const TOKEN_EXPIRATION_HEADROOM: Duration = Duration::new(30, 0);
 
 /// Read the value stored in the specified register.
@@ -622,6 +622,13 @@ impl Context {
                         .await?;
                     return Ok(());
                 }
+                "until-next-schedule" => {
+                    let body = serde_json::json!({ "data": { "type": "ParkUntilNextSchedule" } });
+                    self.mower_action(mower_id, body).await?;
+                    self.publish_target(device_id, &MOWER_NODE_ID, &MOWER_PARKED_PROP_ID, val)
+                        .await?;
+                    return Ok(());
+                }
                 "no" => {
                     let body = serde_json::json!({ "data": { "type": "ResumeSchedule" } });
                     self.mower_action(mower_id, body).await?;
@@ -832,10 +839,15 @@ impl MowerContext {
         .unwrap()
         .settable(true)
         .build();
-        let parked_prop = PropertyDescriptionBuilder::enumeration(["no", "yes", "for-duration"])
-            .unwrap()
-            .settable(true)
-            .build();
+        let parked_prop = PropertyDescriptionBuilder::enumeration([
+            "no",
+            "yes",
+            "until-next-schedule",
+            "for-duration",
+        ])
+        .unwrap()
+        .settable(true)
+        .build();
         let paused_prop = PropertyDescriptionBuilder::boolean().settable(true).build();
         let inactive_summary_prop =
             PropertyDescriptionBuilder::enumeration(["no", "planning", "searching-for-satellites"])
