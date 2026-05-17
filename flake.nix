@@ -10,7 +10,7 @@
             src = ./.;
             cargoLock.lockFile = ./Cargo.lock;
             cargoLock.outputHashes = {
-                "homie5-0.7.0" = "sha256-4uSlLk+pbvTtp7CIx6N39a9dFpWD93Vu5r1NsMuR90U=";
+                "homie5-0.10.1" = "sha256-gIzYfXuSgKMzOJ4dEFrlHc+BEWG3vnxt8YZoz1bj8jI=";
             };
             doCheck = false;
         };
