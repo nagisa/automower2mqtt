@@ -5,6 +5,7 @@ use homie5::client::Publish as HomiePublish;
 use homie5::client::Subscription;
 use homie5::device_description::DeviceDescriptionBuilder;
 use homie5::device_description::HomieDeviceDescription;
+use homie5::device_description::HomiePropertyDescription;
 use homie5::device_description::NodeDescriptionBuilder;
 use homie5::device_description::PropertyDescriptionBuilder;
 use homie5::{Homie5DeviceProtocol, HomieDeviceStatus, HomieID};
@@ -39,6 +40,10 @@ static MOWER_ACTIVITY_PROP_ID: HomieID = HomieID::new_const("activity");
 static MOWER_INACTIVE_REASON_PROP_ID: HomieID = HomieID::new_const("inactive-reason");
 static MOWER_STATE_PROP_ID: HomieID = HomieID::new_const("state");
 static MOWER_ERROR_CODE_PROP_ID: HomieID = HomieID::new_const("error-code");
+static MOWER_MOWING_PROP_ID: HomieID = HomieID::new_const("mowing");
+static MOWER_PARKED_PROP_ID: HomieID = HomieID::new_const("parked");
+static MOWER_PAUSED_PROP_ID: HomieID = HomieID::new_const("paused");
+static MOWER_INACTIVE_PROP_ID: HomieID = HomieID::new_const("inactive");
 static MOWER_WORK_AREA_ID_PROP_ID: HomieID = HomieID::new_const("work-area");
 static PLANNER_NODE_ID: HomieID = HomieID::new_const("planner");
 static PLANNER_NEXT_START_PROP_ID: HomieID = HomieID::new_const("next-start");
@@ -125,6 +130,12 @@ enum Error {
     ReadPostResponse(#[source] reqwest::Error, String),
     #[error("could not publish value to `{0}/{1}`")]
     PublishValue(
+        #[source] rumqttc::v5::ClientError,
+        &'static HomieID,
+        &'static HomieID,
+    ),
+    #[error("could not publish value to `{0}/{1}/$target`")]
+    PublishTarget(
         #[source] rumqttc::v5::ClientError,
         &'static HomieID,
         &'static HomieID,
@@ -407,7 +418,7 @@ impl Context {
                             warn!(id, "received event for mower we don't know about, consider restarting?");
                             continue;
                         };
-                        if let Err(e) = mower.record_event(event).await {
+                        if let Err(e) = mower.record_event(event, false).await {
                             break 'reconnect e;
                         }
                     },
@@ -569,27 +580,78 @@ impl Context {
                     tracing::error!(%node_id, %prop_id, %val, "cutting height value is not a number");
                     return Ok(());
                 };
-                return self
-                    .set_setting(
-                        mower_id,
-                        serde_json::json!({ "data": {
-                            "type": "settings",
-                            "attributes": { "cuttingHeight": height }
-                        }}),
-                    )
-                    .await;
+                let body = serde_json::json!({ "data": {
+                    "type": "settings",
+                    "attributes": { "cuttingHeight": height }
+                }});
+                return self.set_setting(mower_id, body).await;
             }
             ("settings", "headlight-mode") => {
-                return self
-                    .set_setting(
-                        mower_id,
-                        serde_json::json!({ "data": {
-                            "type": "settings",
-                            "attributes": { "headlight": { "mode": val } }
-                        }}),
-                    )
-                    .await;
+                let body = serde_json::json!({ "data": {
+                    "type": "settings",
+                    "attributes": { "headlight": { "mode": val } }
+                }});
+                return self.set_setting(mower_id, body).await;
             }
+            ("mower", "mowing") => match &*val {
+                "yes" => {
+                    let body = serde_json::json!({ "data": { "type": "ResumeSchedule" } });
+                    self.mower_action(mower_id, body).await?;
+                    self.publish_target(device_id, &MOWER_NODE_ID, &MOWER_MOWING_PROP_ID, val)
+                        .await?;
+                    return Ok(());
+                }
+                "no" => {
+                    let body = serde_json::json!({ "data": { "type": "Pause" } });
+                    self.mower_action(mower_id, body).await?;
+                    self.publish_target(device_id, &MOWER_NODE_ID, &MOWER_MOWING_PROP_ID, val)
+                        .await?;
+                    return Ok(());
+                }
+                "forced-for-duration" | "forced-in-workarea" => {
+                    // TODO: figure out parameters.
+                    return Ok(());
+                }
+                _ => return Ok(()),
+            },
+            ("mower", "parked") => match &*val {
+                "yes" => {
+                    let body = serde_json::json!({ "data": { "type": "ParkUntilFurtherNotice" } });
+                    self.mower_action(mower_id, body).await?;
+                    self.publish_target(device_id, &MOWER_NODE_ID, &MOWER_PARKED_PROP_ID, val)
+                        .await?;
+                    return Ok(());
+                }
+                "no" => {
+                    let body = serde_json::json!({ "data": { "type": "ResumeSchedule" } });
+                    self.mower_action(mower_id, body).await?;
+                    self.publish_target(device_id, &MOWER_NODE_ID, &MOWER_PARKED_PROP_ID, val)
+                        .await?;
+                    return Ok(());
+                }
+                "for-duration" => {
+                    // TODO: figure out how to pass parameters.
+                    return Ok(());
+                }
+                _ => return Ok(()),
+            },
+            ("mower", "paused") => match &*val {
+                "true" => {
+                    let body = serde_json::json!({ "data": { "type": "Pause" } });
+                    self.mower_action(mower_id, body).await?;
+                    self.publish_target(device_id, &MOWER_NODE_ID, &MOWER_PAUSED_PROP_ID, val)
+                        .await?;
+                    return Ok(());
+                }
+                "false" => {
+                    let body = serde_json::json!({ "data": { "type": "ResumeSchedule" } });
+                    self.mower_action(mower_id, body).await?;
+                    self.publish_target(device_id, &MOWER_NODE_ID, &MOWER_PAUSED_PROP_ID, val)
+                        .await?;
+                    return Ok(());
+                }
+                _ => return Ok(()),
+            },
             (_, _) => {
                 unreachable!()
             }
@@ -648,6 +710,28 @@ impl Context {
 
     async fn set_setting(&self, mower_id: &str, json: serde_json::Value) -> Result<(), Error> {
         self.post_api(mower_id, "settings", json).await
+    }
+
+    async fn mower_action(&self, mower_id: &str, json: serde_json::Value) -> Result<(), Error> {
+        self.post_api(mower_id, "actions", json).await
+    }
+
+    async fn publish_target(
+        &self,
+        device_id: &str,
+        node_id: &'static HomieID,
+        prop_id: &'static HomieID,
+        target: impl Into<String>,
+    ) -> Result<(), Error> {
+        let protocol = self.protocol.clone_for_child(
+            HomieID::try_from(device_id.to_owned()).expect("known valid homie device id"),
+        );
+        let p = protocol.publish_target(node_id, prop_id, target, true);
+        self.mqtt
+            .homie_publish(p)
+            .await
+            .map_err(|e| Error::PublishTarget(e, node_id, prop_id))?;
+        Ok(())
     }
 }
 
@@ -738,6 +822,25 @@ impl MowerContext {
         .build();
         let error_code_prop = PropertyDescriptionBuilder::integer().range(0..=724).build();
         let work_area_prop = PropertyDescriptionBuilder::integer().build();
+        let mowing_prop = PropertyDescriptionBuilder::enumeration([
+            "no",
+            "yes",
+            "forced-for-duration",
+            "forced-in-workarea",
+            "commuting",
+        ])
+        .unwrap()
+        .settable(true)
+        .build();
+        let parked_prop = PropertyDescriptionBuilder::enumeration(["no", "yes", "for-duration"])
+            .unwrap()
+            .settable(true)
+            .build();
+        let paused_prop = PropertyDescriptionBuilder::boolean().settable(true).build();
+        let inactive_summary_prop =
+            PropertyDescriptionBuilder::enumeration(["no", "planning", "searching-for-satellites"])
+                .unwrap()
+                .build();
         let mower_node = NodeDescriptionBuilder::new()
             .add_property(MOWER_MODE_PROP_ID.clone(), mode_prop)
             .add_property(MOWER_ACTIVITY_PROP_ID.clone(), activity_prop)
@@ -745,6 +848,10 @@ impl MowerContext {
             .add_property(MOWER_STATE_PROP_ID.clone(), state_prop)
             .add_property(MOWER_ERROR_CODE_PROP_ID.clone(), error_code_prop)
             .add_property(MOWER_WORK_AREA_ID_PROP_ID.clone(), work_area_prop)
+            .add_property(MOWER_MOWING_PROP_ID.clone(), mowing_prop)
+            .add_property(MOWER_PARKED_PROP_ID.clone(), parked_prop)
+            .add_property(MOWER_PAUSED_PROP_ID.clone(), paused_prop)
+            .add_property(MOWER_INACTIVE_PROP_ID.clone(), inactive_summary_prop)
             .build();
         let restricted_reason_prop = PropertyDescriptionBuilder::enumeration([
             "NONE",
@@ -846,7 +953,7 @@ impl MowerContext {
         }
     }
 
-    fn is_retained(&self, node_id: &HomieID, prop_id: &HomieID) -> bool {
+    fn prop_description(&self, node_id: &HomieID, prop_id: &HomieID) -> &HomiePropertyDescription {
         self.description
             .nodes
             .get(node_id)
@@ -856,10 +963,13 @@ impl MowerContext {
             .unwrap_or_else(|| {
                 panic!("attempting to publish unkonwn automower property `{node_id}/{prop_id}`")
             })
-            .retained
     }
 
-    async fn record_event(&self, event: schemas::websocket::Event) -> Result<(), Error> {
+    async fn record_event(
+        &self,
+        event: schemas::websocket::Event,
+        publish_targets: bool,
+    ) -> Result<(), Error> {
         let events = match event {
             schemas::websocket::Event::BatteryEventV2 { attributes: a, .. } => {
                 let mut data = self.data.lock().await;
@@ -868,7 +978,7 @@ impl MowerContext {
                     .and_then(|b| b.battery_percent)
                     .unwrap_or(data.battery_percent);
                 let pct = data.battery_percent.to_string();
-                vec![(&BATTERY_NODE_ID, &BATTERY_LEVEL_PROP_ID, pct)]
+                vec![(&BATTERY_NODE_ID, &BATTERY_LEVEL_PROP_ID, None, pct)]
             }
             schemas::websocket::Event::CalendarEventV2 { attributes: _a, .. } => return Ok(()),
             schemas::websocket::Event::CuttingHeightEventV2 { attributes: a, .. } => {
@@ -881,7 +991,12 @@ impl MowerContext {
                     return Ok(());
                 };
                 let ch = ch.to_string();
-                vec![(&SETTINGS_NODE_ID, &SETTINGS_CUTTING_HEIGHT_PROP_ID, ch)]
+                vec![(
+                    &SETTINGS_NODE_ID,
+                    &SETTINGS_CUTTING_HEIGHT_PROP_ID,
+                    None,
+                    ch,
+                )]
             }
             schemas::websocket::Event::HeadlightsEventV2 { attributes: a, .. } => {
                 let mut data = self.data.lock().await;
@@ -889,7 +1004,7 @@ impl MowerContext {
                 let Some(mode) = data.headlight_mode.clone() else {
                     return Ok(());
                 };
-                vec![(&SETTINGS_NODE_ID, &SETTINGS_HEADLIGHT_PROP_ID, mode)]
+                vec![(&SETTINGS_NODE_ID, &SETTINGS_HEADLIGHT_PROP_ID, None, mode)]
             }
             schemas::websocket::Event::MessageEventV2 { attributes: _a, .. } => return Ok(()),
             schemas::websocket::Event::MowerEventV2 { attributes: a, .. } => {
@@ -898,28 +1013,66 @@ impl MowerContext {
                 let mut data = self.data.lock().await;
                 if let Some(mode) = mower.mode {
                     data.mower_mode = mode.clone();
-                    evts.push((&MOWER_NODE_ID, &MOWER_MODE_PROP_ID, mode));
+                    evts.push((&MOWER_NODE_ID, &MOWER_MODE_PROP_ID, None, mode));
                 }
                 if let Some(activity) = mower.activity {
                     data.mower_activity = activity.clone();
-                    evts.push((&MOWER_NODE_ID, &MOWER_ACTIVITY_PROP_ID, activity));
+                    evts.push((&MOWER_NODE_ID, &MOWER_ACTIVITY_PROP_ID, None, activity));
                 }
                 if let Some(reason) = mower.inactive_reason {
                     data.mower_inactive_reason = Some(reason.clone());
-                    evts.push((&MOWER_NODE_ID, &MOWER_INACTIVE_REASON_PROP_ID, reason));
+                    evts.push((&MOWER_NODE_ID, &MOWER_INACTIVE_REASON_PROP_ID, None, reason));
                 }
                 if let Some(state) = mower.state {
                     data.mower_state = state.clone();
-                    evts.push((&MOWER_NODE_ID, &MOWER_STATE_PROP_ID, state));
+                    evts.push((&MOWER_NODE_ID, &MOWER_STATE_PROP_ID, None, state));
                 }
                 if let Some(ec) = mower.error_code {
                     data.error_code = Some(ec);
-                    evts.push((&MOWER_NODE_ID, &MOWER_ERROR_CODE_PROP_ID, ec.to_string()));
+                    evts.push((
+                        &MOWER_NODE_ID,
+                        &MOWER_ERROR_CODE_PROP_ID,
+                        None,
+                        ec.to_string(),
+                    ));
                 }
                 if let Some(id) = mower.work_area_id {
                     data.work_area_id = Some(id);
-                    evts.push((&MOWER_NODE_ID, &MOWER_WORK_AREA_ID_PROP_ID, id.to_string()));
+                    evts.push((
+                        &MOWER_NODE_ID,
+                        &MOWER_WORK_AREA_ID_PROP_ID,
+                        None,
+                        id.to_string(),
+                    ));
                 }
+                let mowing_value = derive_mowing(&data).to_string();
+                evts.push((
+                    &MOWER_NODE_ID,
+                    &MOWER_MOWING_PROP_ID,
+                    publish_targets.then(|| mowing_value.clone()),
+                    mowing_value,
+                ));
+                let parked_value = derive_parked(&data).to_string();
+                evts.push((
+                    &MOWER_NODE_ID,
+                    &MOWER_PARKED_PROP_ID,
+                    publish_targets.then(|| parked_value.clone()),
+                    parked_value,
+                ));
+                let paused_value = derive_paused(&data).to_string();
+                evts.push((
+                    &MOWER_NODE_ID,
+                    &MOWER_PAUSED_PROP_ID,
+                    publish_targets.then(|| paused_value.clone()),
+                    paused_value,
+                ));
+                evts.push((
+                    &MOWER_NODE_ID,
+                    &MOWER_INACTIVE_PROP_ID,
+                    None,
+                    derive_inactive(&data).to_string(),
+                ));
+
                 evts
             }
             schemas::websocket::Event::PlannerEventV2 { attributes: a, .. } => {
@@ -928,7 +1081,6 @@ impl MowerContext {
                     return Ok(());
                 };
                 let mut data = self.data.lock().await;
-
                 if let Some(t) = planner.next_start_timestamp {
                     data.planner_next_start = t;
                     let dt = if t == 0 {
@@ -936,20 +1088,25 @@ impl MowerContext {
                     } else {
                         mower_datetime(t).to_string()
                     };
-                    evts.push((&PLANNER_NODE_ID, &PLANNER_NEXT_START_PROP_ID, dt));
+                    evts.push((&PLANNER_NODE_ID, &PLANNER_NEXT_START_PROP_ID, None, dt));
                 }
                 if let Some(o) = planner.r#override {
                     data.planner_override = Some(o.action.clone());
-                    evts.push((&PLANNER_NODE_ID, &PLANNER_OVERRIDE_PROP_ID, o.action));
+                    evts.push((&PLANNER_NODE_ID, &PLANNER_OVERRIDE_PROP_ID, None, o.action));
                 }
                 if let Some(r) = planner.restricted_reason {
                     data.planner_restricted_reason = r.clone();
-                    evts.push((&PLANNER_NODE_ID, &PLANNER_RESTRICTED_REASON_PROP_ID, r));
+                    evts.push((
+                        &PLANNER_NODE_ID,
+                        &PLANNER_RESTRICTED_REASON_PROP_ID,
+                        None,
+                        r,
+                    ));
                 }
                 if let Some(r) = planner.external_reason {
                     data.planner_external_reason = Some(r);
                     let r = r.to_string();
-                    evts.push((&PLANNER_NODE_ID, &PLANNER_EXTERNAL_REASON_PROP_ID, r));
+                    evts.push((&PLANNER_NODE_ID, &PLANNER_EXTERNAL_REASON_PROP_ID, None, r));
                 }
                 evts
             }
@@ -962,18 +1119,27 @@ impl MowerContext {
                     return Ok(());
                 };
                 let latlon = format!("{},{}", lat, lon);
-                vec![(&POSITION_NODE_ID, &POSITION_LATLON_PROP_ID, latlon)]
+                vec![(&POSITION_NODE_ID, &POSITION_LATLON_PROP_ID, None, latlon)]
             }
         };
-        for (node_id, prop_id, value) in events {
-            let retained = Self::is_retained(self, node_id, prop_id);
+        for (node_id, prop_id, target, value) in events {
+            let prop_desc = self.prop_description(node_id, prop_id);
             let p = self
                 .protocol
-                .publish_value(node_id, prop_id, value, retained);
+                .publish_value(node_id, prop_id, &value, prop_desc.retained);
             self.mqtt
                 .homie_publish(p)
                 .await
                 .map_err(|e| Error::PublishValue(e, node_id, prop_id))?;
+            if let Some(tgt) = target {
+                let p = self
+                    .protocol
+                    .publish_target(node_id, prop_id, tgt, prop_desc.retained);
+                self.mqtt
+                    .homie_publish(p)
+                    .await
+                    .map_err(|e| Error::PublishTarget(e, node_id, prop_id))?;
+            }
         }
         Ok(())
     }
@@ -1059,7 +1225,7 @@ impl MowerContext {
                         ]
                     };
                     for ev in evs {
-                        self.record_event(ev).await?;
+                        self.record_event(ev, true).await?;
                     }
                 }
                 homie5::DevicePublishStep::SubscribeProperties => {
@@ -1138,4 +1304,43 @@ fn mower_datetime(since_mower_epoch: u64) -> jiff::civil::DateTime {
     EPOCH
         .checked_add(duration)
         .expect("adding milliseconds to epoch should never overflow?")
+}
+
+fn derive_mowing(data: &MowerState) -> &'static str {
+    match &*data.mower_state {
+        "GOING_HOME" | "LEAVING" => "commuting",
+        "MOWING" if data.planner_override.as_deref() == Some("FORCE_MOW") => {
+            if data.work_area_id.unwrap_or(0) == 0 {
+                "forced-for-duration"
+            } else {
+                "forced-in-workarea"
+            }
+        }
+        "MOWING" => "yes",
+        _ => "no",
+    }
+}
+
+fn derive_parked(data: &MowerState) -> &'static str {
+    if let "CHARGING" | "PARKED_IN_CS" = &*data.mower_activity {
+        if data.planner_override.as_deref() == Some("FORCE_PARK") {
+            "for-duration"
+        } else {
+            "yes"
+        }
+    } else {
+        "no"
+    }
+}
+
+fn derive_paused(data: &MowerState) -> bool {
+    data.mower_state == "PAUSED"
+}
+
+fn derive_inactive(data: &MowerState) -> &'static str {
+    match data.mower_inactive_reason.as_deref() {
+        Some("PLANNING") => "planning",
+        Some("SEARCHING_FOR_SATELLITES") => "searching-for-satellites",
+        _ => "no",
+    }
 }

@@ -8,6 +8,44 @@ capable of connecting to WiFi. This tool provides a basic homie-compliant(ish) M
 the API and your home control things, so you don't have to bake in the API logic into your home
 automation system.
 
+## Controlling the mower
+
+### Background
+
+MQTT and the automower API have a strong impedance mismatch, so the changes to the mower operation
+are implemented in a fairly ad-hoc manner that does not necessarily make the interface very DRY
+(dont-repeat-yourself.)
+
+For instance this bridge exposes automower telemetry via MQTT properties such as
+`$prefix/mower/mode=MAIN_AREA|SECONDARY_AREA|HOME|...`,
+`$prefix/mower/activity=MOWING|CHARGING|...`, `$prefix/mower/state=IN_OPERATION|PAUSED|...` and
+similar atributes that are reflected verbatim from the API. However these make it relatively
+difficult to expose as settable properties that describe the intent. As in, saying "I want my mower
+to park now" could be expressed in one of `mower.mode=HOME`, `planner.PARK_NOW`,
+`mower.state=RESTRICTED`, etc. Each would have non-obvious differences in behaviour, for example
+`mode=HOME` is the telemetry you get when you "Park until further notice" in the app, whereas "Park
+until next schedule" would be `planner.override=PARK_NOW`. `RESTRICTED` parking would require to
+somehow also specify the restricted code, which would require synchronization between multiple
+properties.
+
+Instead this bridge introduces separate properties that are intent focused and potentially
+overlapping in their meaning.
+
+### Examples of settable properties
+
+The up-to-date and exhaustive list is available in the published Homie `$description` as well as in
+the source code. This text provides some most prominent examples:
+
+* `$prefix/mower/paused/set = true|false`: true will pause the mower, false will “resume”
+* `$prefix/mower/mowing/set = yes|no`: inverted behaviour to paused. `yes` will “resume”. Separate
+  attribute to later allow for potentially specifying forced mowing.
+* `$prefix/mower/parked/set = yes|no`: yes will park until further notice, `no` will “resume”.
+* `$prefix/settings/headlight-mode = ALWAYS_ON|ALWAYS_OFF|EVENING_ONLY|EVENING_AND_NIGHT`;
+
 > [!NOTE]
-> The implementation currently exposes only a basic read-only view of the device, and an ability to
-> change some settings. Ability to control the Automower is a future extension.
+> The implementation currently in a pretty crude state meant to only serve exactly my personal
+> needs. Suggestions and improvements are very welcome. I do try to not overcomplicate the
+> implementation too much with layers of abstraction, so it should be relatively approachable to
+> you (or your AI agent.)
+>
+> Please do not submit changes that haven't had human review, however.
