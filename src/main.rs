@@ -66,6 +66,45 @@ const CONNECT_TIMEOUT: Duration = Duration::new(10, 0);
 const API_REQUEST_TIMEOUT: Duration = Duration::new(20, 0);
 const TOKEN_EXPIRATION_HEADROOM: Duration = Duration::new(30, 0);
 
+#[derive(Clone, Debug)]
+struct ExternalInhibit {
+    name: HomieID,
+    reason: i32,
+    duration_minutes: u16,
+}
+
+impl std::str::FromStr for ExternalInhibit {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let (name, rest) = value
+            .split_once('=')
+            .ok_or_else(|| "expected NAME=REASON:DURATION")?;
+        let (reason, duration) = rest
+            .split_once(':')
+            .ok_or_else(|| "expected NAME=REASON:DURATION")?;
+        let name = HomieID::from_str(&format!("external-inhibit-{name}"))
+            .map_err(|_| "invalid inhibit name for a property")?;
+        let reason = reason
+            .parse::<i32>()
+            .map_err(|_| "invalid external reason")?;
+        if !(200_000..300_000).contains(&reason) {
+            return Err("external reason must be in [200000, 300000)".into());
+        }
+        let duration_minutes = duration
+            .parse::<u16>()
+            .map_err(|_| "invalid inhibit duration")?;
+        if !(1..=1500).contains(&duration_minutes) {
+            return Err("duration must be in [1, 1500]".into());
+        }
+        Ok(Self {
+            name,
+            reason,
+            duration_minutes,
+        })
+    }
+}
+
 /// Read the value stored in the specified register.
 #[derive(clap::Parser)]
 struct Args {
@@ -100,6 +139,16 @@ struct Args {
     /// Application secret credential from your application in Husqvarna Developer API portal.
     #[clap(short = 's', long, env = "AUTOMOWER_APP_SECRET")]
     app_secret: String,
+
+    /// Configure an external inhibit as `NAME=REASON:DURATION_MINUTES`.
+    ///
+    /// This will expose additional properties `planner/external-inhibit-NAME` which, when activated
+    /// will have mower go back to the charging station for `DURATION_MINUTES`. This inhibit can be
+    /// continuously reactivated to extend the duration.
+    ///
+    /// e.g. --external-inhibit rain=200101:1500 --external-inhibit dew=200102:60
+    #[clap(long)]
+    external_inhibit: Vec<ExternalInhibit>,
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -214,6 +263,7 @@ fn setup_and_run(args: Args) -> Result<(), Error> {
         mqtt,
         app_key: args.app_key,
         app_secret: args.app_secret,
+        external_inhibits: args.external_inhibit,
     });
     runtime.block_on(context.run(mqtt_loop))
 }
@@ -262,6 +312,7 @@ struct Context {
     mqtt: rumqttc::v5::AsyncClient,
     app_key: String,
     app_secret: String,
+    external_inhibits: Vec<ExternalInhibit>,
 }
 
 impl Context {
@@ -332,6 +383,7 @@ impl Context {
                     self.client.clone(),
                     self.mqtt.clone(),
                     &self.protocol,
+                    &self.external_inhibits
                 )
                 .await,
             );
@@ -659,6 +711,32 @@ impl Context {
                 }
                 _ => return Ok(()),
             },
+            ("planner", prop_id) => {
+                let Some(inhibit) = self
+                    .external_inhibits
+                    .iter()
+                    .find(|inhibit| inhibit.name.as_str() == prop_id)
+                else {
+                    unreachable!()
+                };
+                let duration = match &*val {
+                    "enable" => inhibit.duration_minutes,
+                    "disable" => 1,
+                    _ => {
+                        tracing::error!(%node_id, %prop_id, %val, "invalid external inhibit command");
+                        return Ok(());
+                    }
+                };
+                let data = serde_json::json!({"data": {
+                    "type": "Park",
+                    "attributes": {
+                        "duration": duration,
+                        "externalReason": inhibit.reason
+                    }
+                }});
+                return self.post_api(mower_id, "actions", data).await;
+            }
+
             (_, _) => {
                 unreachable!()
             }
@@ -759,6 +837,7 @@ impl MowerContext {
         client: reqwest::Client,
         mqtt: rumqttc::v5::AsyncClient,
         root_protocol: &Homie5DeviceProtocol,
+        external_inhibits: &[ExternalInhibit],
     ) -> Self {
         let root_id = root_protocol.device_ref().device_id();
         let child_device_id = HomieID::try_from(Self::id_to_key(&api_id, root_protocol)).unwrap();
@@ -887,7 +966,7 @@ impl MowerContext {
         let external_reason_prop = PropertyDescriptionBuilder::integer()
             .range(1000..=299_999)
             .build();
-        let planner_node = NodeDescriptionBuilder::new()
+        let mut planner_node = NodeDescriptionBuilder::new()
             .add_property(PLANNER_OVERRIDE_PROP_ID.clone(), override_prop)
             .add_property(PLANNER_NEXT_START_PROP_ID.clone(), next_start_prop)
             .add_property(
@@ -897,8 +976,17 @@ impl MowerContext {
             .add_property(
                 PLANNER_RESTRICTED_REASON_PROP_ID.clone(),
                 restricted_reason_prop,
-            )
-            .build();
+            );
+        for inhibit in external_inhibits {
+            let prop = PropertyDescriptionBuilder::enumeration(["enable", "disable"])
+                .unwrap()
+                .settable(true)
+                .retained(false)
+                .build();
+            planner_node = planner_node.add_property(inhibit.name.clone(), prop);
+        }
+        let planner_node = planner_node.build();
+
         let cutting_height_prop = PropertyDescriptionBuilder::integer()
             .unit(HOMIE_UNIT_PERCENT)
             .range(0..=100)

@@ -8,6 +8,19 @@ capable of connecting to WiFi. This tool provides a basic homie-compliant(ish) M
 the API and your home control things, so you don't have to bake in the API logic into your home
 automation system.
 
+> [!NOTE]
+> The implementation currently in a pretty crude state meant to only serve exactly my personal
+> needs. Suggestions and improvements are very welcome. I do try to not overcomplicate the
+> implementation too much with layers of abstraction or complexity, so it should be relatively
+> approachable to you (or your AI agent.)
+>
+> Please do not submit changes that haven't had human review, however.
+
+## Configuration
+
+The `automower2mqtt` tool is configured via command line arguments and environment variables.
+Run `automower2mqtt --help` for up-to date documentation here.
+
 ## Controlling the mower
 
 ### Background
@@ -43,10 +56,19 @@ the source code. This text provides some most prominent examples:
   `until-next-schedule` is self-explanatory, `no` will “resume”.
 * `$prefix/settings/headlight-mode = ALWAYS_ON|ALWAYS_OFF|EVENING_ONLY|EVENING_AND_NIGHT`;
 
-> [!NOTE]
-> The implementation currently in a pretty crude state meant to only serve exactly my personal
-> needs. Suggestions and improvements are very welcome. I do try to not overcomplicate the
-> implementation too much with layers of abstraction, so it should be relatively approachable to
-> you (or your AI agent.)
->
-> Please do not submit changes that haven't had human review, however.
+### External inhibits
+
+If you have configured `--external-inhibit`s, you can have your mower return back to the charging
+station in reaction to external events such as rain, a BBQ party or whatever else you can imagine.
+
+Lets say we have a rain sensor and want to prevent wet cuttings sticking to the mower. Start by
+specifying the `--external-inhibit rain=200100:1500`. This will create a new property
+`$prefix/planner/external-inhibit-rain` which can be either `enable`d or `disable`d. Have your
+automation system periodically (every 30 minutes, perhaps?) send `enable` to this property's `/set`
+as long as rain is being detected. Once the rain stops and your automation stops sending the
+`enable` command, the mower will continue waiting for 25 further hours (1500 minutes as specified
+in the argument) for the lawn to dry off a bit more.
+
+You can specify as many such different inhibitors as you want. You might want another one for `dew`
+that prevents mowing just for an hour or two on certain mornings, or a `bbq` inhibitor that lasts
+for 8 hours so that the mower does not interfere with your party.
