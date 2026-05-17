@@ -115,10 +115,14 @@ enum Error {
     GenerateSubscribtions(#[source] homie5::Homie5ProtocolError),
     #[error("could not subscribe to the homie properties")]
     Subscribe(#[source] rumqttc::v5::ClientError),
-    #[error("could not make a request to the `{1}` API endpoint")]
+    #[error("could not make a request to the `GET {1}` API endpoint")]
     GetApi(#[source] reqwest::Error, &'static str),
-    #[error("could not read the API response for `{1}`")]
-    ReadResponse(#[source] reqwest::Error, &'static str),
+    #[error("could not make a request to the `POST {1}` API endpoint")]
+    PostApi(#[source] reqwest::Error, String),
+    #[error("could not read the API response for `GET {1}`")]
+    ReadGetResponse(#[source] reqwest::Error, &'static str),
+    #[error("could not read the API response for `POST {1}`")]
+    ReadPostResponse(#[source] reqwest::Error, String),
     #[error("could not publish value to `{0}/{1}`")]
     PublishValue(
         #[source] rumqttc::v5::ClientError,
@@ -299,11 +303,11 @@ impl Context {
             .header("authorization-provider", "husqvarna")
             .send()
             .await
-            .map_err(|e| Error::GetApi(e, "GET /mowers"))?;
+            .map_err(|e| Error::GetApi(e, "/mowers"))?;
         let response = response
             .json::<schemas::automower::JsonApiDataListDocument>()
             .await
-            .map_err(|e| Error::ReadResponse(e, "GET /mowers"))?;
+            .map_err(|e| Error::ReadGetResponse(e, "/mowers"))?;
         tracing::debug!(?response, uri = "/mowers", method = "GET");
         let mut result = Vec::with_capacity(response.data.len());
         for datum in response.data {
@@ -592,45 +596,58 @@ impl Context {
         }
     }
 
-    async fn set_setting(&self, mower_id: &str, json: serde_json::Value) -> Result<(), Error> {
+    async fn post_api(
+        &self,
+        mower_id: &str,
+        command: &str,
+        body: serde_json::Value,
+    ) -> Result<(), Error> {
         let token = self.get_token().await?;
         let response = self
             .client
             .post(format!(
-                "{AUTOMOWER_CONNECT_API_BASE}/mowers/{mower_id}/settings"
+                "{AUTOMOWER_CONNECT_API_BASE}/mowers/{mower_id}/{command}"
             ))
             .header("accept", "application/vnd.api+json")
             .header("content-type", "application/vnd.api+json")
             .header("x-api-key", &self.app_key)
             .header("authorization", format!("Bearer {token}"))
             .header("authorization-provider", "husqvarna")
-            .json(&json)
+            .json(&body)
             .send()
             .await
-            .map_err(|e| Error::GetApi(e, "POST /mowers/{mower_id}/settings"))?;
+            .map_err(|e| Error::PostApi(e, format!("/mowers/{mower_id}/{command}")))?;
         let code = response.status();
         if !code.is_success() {
             let response = response
                 .text()
                 .await
-                .map_err(|e| Error::ReadResponse(e, "POST /mowers/{mower_id}/settings"))?;
+                .map_err(|e| Error::ReadPostResponse(e, format!("/mowers/{mower_id}/{command}")))?;
             tracing::error!(
                 ?response,
-                uri = "/mowers/{mower_id}/settings",
+                uri = "/mowers/{mower_id}/{command}",
+                mower_id,
+                command,
                 method = "POST"
             );
         } else {
             let response = response
                 .json::<serde_json::Value>()
                 .await
-                .map_err(|e| Error::ReadResponse(e, "POST /mowers/{mower_id}/settings"))?;
+                .map_err(|e| Error::ReadPostResponse(e, format!("/mowers/{mower_id}/{command}")))?;
             tracing::debug!(
                 ?response,
-                uri = "/mowers/{mower_id}/settings",
+                uri = "/mowers/{mower_id}/{command}",
+                mower_id,
+                command,
                 method = "POST"
             );
         }
         Ok(())
+    }
+
+    async fn set_setting(&self, mower_id: &str, json: serde_json::Value) -> Result<(), Error> {
+        self.post_api(mower_id, "settings", json).await
     }
 }
 

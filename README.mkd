@@ -9,5 +9,5 @@ the API and your home control things, so you don't have to bake in the API logic
 automation system.
 
 > [!NOTE]
-> The implementation currently exposes only a basic read-only view of the device. Ability to
-> control the Automower is a future extension.
+> The implementation currently exposes only a basic read-only view of the device, and an ability to
+> change some settings. Ability to control the Automower is a future extension.
