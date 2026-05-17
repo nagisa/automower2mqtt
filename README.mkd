@@ -39,7 +39,9 @@ the source code. This text provides some most prominent examples:
 * `$prefix/mower/paused/set = true|false`: true will pause the mower, false will “resume”
 * `$prefix/mower/mowing/set = yes|no`: inverted behaviour to paused. `yes` will “resume”. Separate
   attribute to later allow for potentially specifying forced mowing.
-* `$prefix/mower/parked/set = yes|no`: yes will park until further notice, `no` will “resume”.
+* `$prefix/planner/external-reason/set` with values between 200000 and 300000 to park with an
+  external reason set for the maximum possible duration (25 hours.)
+* `$prefix/mower/parked/set = yes|no`: `yes` will park until further notice, `no` will “resume”.
 * `$prefix/settings/headlight-mode = ALWAYS_ON|ALWAYS_OFF|EVENING_ONLY|EVENING_AND_NIGHT`;
 
 > [!NOTE]

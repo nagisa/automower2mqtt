@@ -652,6 +652,34 @@ impl Context {
                 }
                 _ => return Ok(()),
             },
+            ("planner", "external-reason") => {
+                let Ok(reason) = val.parse::<i32>() else {
+                    tracing::error!(%node_id, %prop_id, %val, "external reason value is not a number");
+                    return Ok(());
+                };
+                if !(0..300000).contains(&reason) {
+                    tracing::warn!(
+                        %node_id,
+                        %prop_id,
+                        %reason,
+                        "ignoring external reason, custom reasons must be in range 200000..300000"
+                    );
+                    return Ok(());
+                }
+                let body = serde_json::json!({ "data": {
+                    "type": "Park",
+                    "attributes": { "duration": 1, "externalReason": reason }
+                }});
+                self.mower_action(mower_id, body).await?;
+                self.publish_target(
+                    device_id,
+                    &PLANNER_NODE_ID,
+                    &PLANNER_EXTERNAL_REASON_PROP_ID,
+                    val,
+                )
+                .await?;
+                return Ok(());
+            }
             (_, _) => {
                 unreachable!()
             }
@@ -874,6 +902,7 @@ impl MowerContext {
         let next_start_prop = PropertyDescriptionBuilder::datetime().build();
         let external_reason_prop = PropertyDescriptionBuilder::integer()
             .range(1000..=299_999)
+            .settable(true)
             .build();
         let planner_node = NodeDescriptionBuilder::new()
             .add_property(PLANNER_OVERRIDE_PROP_ID.clone(), override_prop)
