@@ -1,3 +1,5 @@
+#![expect(dead_code)]
+
 pub(crate) mod oauth {
     #[derive(Debug, serde::Deserialize)]
     pub(crate) struct TokenResponse {
@@ -7,6 +9,8 @@ pub(crate) mod oauth {
 }
 
 pub(crate) mod automower {
+    use serde::Deserialize;
+
     #[derive(Debug, serde::Deserialize)]
     pub(crate) struct JsonApiDataListDocument {
         pub(crate) data: Vec<JsonApiData>,
@@ -19,7 +23,7 @@ pub(crate) mod automower {
         pub(crate) attributes: MowerData,
     }
 
-    #[derive(Debug, serde::Deserialize)]
+    #[derive(Debug, Clone, serde::Deserialize)]
     #[serde(rename_all = "camelCase")]
     pub(crate) struct MowerData {
         pub(crate) system: System,
@@ -36,7 +40,7 @@ pub(crate) mod automower {
         pub(crate) work_areas: Option<Vec<WorkArea>>,
     }
 
-    #[derive(Debug, serde::Deserialize)]
+    #[derive(Debug, Clone, serde::Deserialize)]
     #[serde(rename_all = "camelCase")]
     pub(crate) struct System {
         pub(crate) name: String,
@@ -44,13 +48,13 @@ pub(crate) mod automower {
         pub(crate) serial_number: u32,
     }
 
-    #[derive(Debug, serde::Deserialize)]
+    #[derive(Debug, Clone, serde::Deserialize)]
     #[serde(rename_all = "camelCase")]
     pub(crate) struct Battery {
         pub(crate) battery_percent: u8,
     }
 
-    #[derive(Debug, serde::Deserialize)]
+    #[derive(Debug, Clone, serde::Deserialize)]
     #[serde(rename_all = "camelCase")]
     pub(crate) struct Capabilities {
         pub(crate) can_confirm_error: bool,
@@ -60,7 +64,7 @@ pub(crate) mod automower {
         pub(crate) work_areas: bool,
     }
 
-    #[derive(Debug, serde::Deserialize)]
+    #[derive(Debug, Clone, serde::Deserialize)]
     #[serde(rename_all = "camelCase")]
     pub(crate) struct MowerApp {
         pub(crate) mode: String,
@@ -73,14 +77,15 @@ pub(crate) mod automower {
         pub(crate) is_error_confirmable: Option<bool>,
     }
 
-    #[derive(Debug, serde::Deserialize)]
+    #[derive(Debug, Clone, serde::Deserialize)]
     #[serde(rename_all = "camelCase")]
     pub(crate) struct Calendar {
         pub(crate) tasks: Vec<CalendarTask>,
     }
 
-    #[derive(Debug, serde::Deserialize)]
+    #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
     #[serde(rename_all = "camelCase")]
+    #[serde(deny_unknown_fields)]
     pub(crate) struct CalendarTask {
         pub(crate) start: u16,
         pub(crate) duration: u16,
@@ -91,23 +96,24 @@ pub(crate) mod automower {
         pub(crate) friday: bool,
         pub(crate) saturday: bool,
         pub(crate) sunday: bool,
+        // this field is not optional in API, we just don't want to send/require this field in the
+        // MQTT property as it unnecessarily duplicates the data...
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "deserialize_optional_i64_or_string"
+        )]
+        pub(crate) work_area_id: Option<i64>,
     }
 
-    #[derive(Debug, serde::Deserialize)]
+    #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
     #[serde(rename_all = "camelCase")]
+    #[serde(deny_unknown_fields)]
     pub(crate) struct CalendarWorkArea {
-        pub(crate) tasks: Vec<CalendarTaskWorkArea>,
+        pub(crate) tasks: Vec<CalendarTask>,
     }
 
-    #[derive(Debug, serde::Deserialize)]
-    #[serde(rename_all = "camelCase")]
-    pub(crate) struct CalendarTaskWorkArea {
-        #[serde(flatten)]
-        pub(crate) calendar_task: CalendarTask,
-        pub(crate) work_area_id: i64,
-    }
-
-    #[derive(Debug, serde::Deserialize)]
+    #[derive(Debug, Clone, serde::Deserialize)]
     #[serde(rename_all = "camelCase")]
     pub(crate) struct Planner {
         pub(crate) next_start_timestamp: u64,
@@ -116,13 +122,13 @@ pub(crate) mod automower {
         pub(crate) external_reason: Option<i32>,
     }
 
-    #[derive(Debug, serde::Deserialize)]
+    #[derive(Debug, Clone, serde::Deserialize)]
     #[serde(rename_all = "camelCase")]
     pub(crate) struct PlannerOverride {
         pub(crate) action: String,
     }
 
-    #[derive(Debug, serde::Deserialize)]
+    #[derive(Debug, Clone, serde::Deserialize)]
     #[serde(rename_all = "camelCase")]
     pub(crate) struct Metadata {
         pub(crate) connected: bool,
@@ -135,15 +141,74 @@ pub(crate) mod automower {
         pub(crate) items: Vec<WorkArea>,
     }
 
-    #[derive(Debug, serde::Deserialize)]
+    #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
     #[serde(rename_all = "camelCase")]
     pub(crate) struct WorkArea {
+        #[serde(default, deserialize_with = "deserialize_optional_i64_or_string")]
         pub(crate) work_area_id: Option<i64>,
         pub(crate) name: Option<String>,
+        pub(crate) r#type: Option<String>,
         pub(crate) cutting_height: Option<u8>,
         pub(crate) enabled: Option<bool>,
+        pub(crate) schedulable: Option<bool>,
+        pub(crate) orientation: Option<u16>,
+        pub(crate) orientation_shift: Option<u16>,
+        pub(crate) current_orientation: Option<u16>,
+        pub(crate) overlap: Option<u16>,
         pub(crate) progress: Option<u8>,
         pub(crate) last_time_completed: Option<i64>,
+        pub(crate) last_time_abandoned: Option<i64>,
+        pub(crate) use_global_cutting_height: Option<bool>,
+        pub(crate) calendar: Option<CalendarWorkArea>,
+    }
+
+    #[derive(Debug, serde::Deserialize)]
+    pub(crate) struct JsonApiDataListDocumentWorkAreas {
+        pub(crate) data: Vec<JsonApiDataWorkArea>,
+    }
+
+    #[derive(Debug, serde::Deserialize)]
+    pub(crate) struct JsonApiDataDocumentWorkArea {
+        pub(crate) data: Option<JsonApiDataWorkArea>,
+    }
+
+    #[derive(Debug, serde::Deserialize)]
+    pub(crate) struct JsonApiDataWorkArea {
+        #[serde(deserialize_with = "deserialize_i64_or_string")]
+        pub(crate) id: i64,
+        pub(crate) attributes: WorkArea,
+    }
+
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum I64OrString {
+        Integer(i64),
+        String(String),
+    }
+
+    impl I64OrString {
+        fn into_i64<E: serde::de::Error>(self) -> Result<i64, E> {
+            match self {
+                Self::Integer(value) => Ok(value),
+                Self::String(value) => value.parse().map_err(E::custom),
+            }
+        }
+    }
+
+    fn deserialize_i64_or_string<'de, D>(deserializer: D) -> Result<i64, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        I64OrString::deserialize(deserializer)?.into_i64()
+    }
+
+    fn deserialize_optional_i64_or_string<'de, D>(deserializer: D) -> Result<Option<i64>, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Option::<I64OrString>::deserialize(deserializer)?
+            .map(I64OrString::into_i64)
+            .transpose()
     }
 
     #[derive(Debug, serde::Deserialize, Clone)]
@@ -153,7 +218,7 @@ pub(crate) mod automower {
         pub(crate) longitude: Option<f64>,
     }
 
-    #[derive(Debug, serde::Deserialize)]
+    #[derive(Debug, Clone, serde::Deserialize)]
     #[serde(rename_all = "camelCase")]
     pub(crate) struct Settings {
         pub(crate) cutting_height: Option<u8>,
@@ -161,13 +226,13 @@ pub(crate) mod automower {
         pub(crate) timer: Option<Timer>,
     }
 
-    #[derive(Debug, serde::Deserialize)]
+    #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
     #[serde(rename_all = "camelCase")]
     pub(crate) struct Headlight {
         pub(crate) mode: String,
     }
 
-    #[derive(Debug, serde::Deserialize)]
+    #[derive(Debug, Clone, serde::Deserialize)]
     #[serde(rename_all = "camelCase")]
     pub(crate) struct Timer {
         pub(crate) date_time: Option<i64>,
@@ -190,7 +255,7 @@ pub(crate) mod automower {
         pub(crate) longitude: Option<f64>,
     }
 
-    #[derive(Debug, serde::Deserialize)]
+    #[derive(Debug, Clone, serde::Deserialize)]
     #[serde(rename_all = "camelCase")]
     pub(crate) struct Statistics {
         pub(crate) cutting_blade_usage_time: Option<u64>,
@@ -205,14 +270,14 @@ pub(crate) mod automower {
         pub(crate) up_time: Option<u64>,
     }
 
-    #[derive(Debug, serde::Deserialize)]
+    #[derive(Debug, Clone, serde::Deserialize)]
     #[serde(rename_all = "camelCase")]
     pub(crate) struct StayOutZones {
         pub(crate) dirty: Option<bool>,
         pub(crate) zones: Option<Vec<StayOutZone>>,
     }
 
-    #[derive(Debug, serde::Deserialize)]
+    #[derive(Debug, Clone, serde::Deserialize)]
     #[serde(rename_all = "camelCase")]
     pub(crate) struct StayOutZone {
         pub(crate) id: Option<String>,

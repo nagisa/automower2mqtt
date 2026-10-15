@@ -1,35 +1,26 @@
 use clap::Parser as _;
-use futures::{SinkExt as _, StreamExt as _};
-use homie5::HOMIE_UNIT_PERCENT;
+use futures::StreamExt as _;
 use homie5::client::Publish as HomiePublish;
 use homie5::client::Subscription;
 use homie5::device_description::DeviceDescriptionBuilder;
 use homie5::device_description::HomieDeviceDescription;
-use homie5::device_description::HomiePropertyDescription;
 use homie5::device_description::NodeDescriptionBuilder;
 use homie5::device_description::PropertyDescriptionBuilder;
+use homie5::{HOMIE_UNIT_DEGREE, HOMIE_UNIT_PERCENT};
 use homie5::{Homie5DeviceProtocol, HomieDeviceStatus, HomieID};
 use rumqttc::v5::MqttOptions;
 use rumqttc::v5::mqttbytes::v5::LastWill;
 use rumqttc::v5::mqttbytes::v5::Publish;
-use schemas::automower::MowerData;
-use std::collections::BTreeMap;
-use std::collections::btree_map;
-use std::str::Utf8Error;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Mutex;
-use tokio_tungstenite::tungstenite;
-use tokio_tungstenite::tungstenite::Bytes;
-use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-use tracing::debug;
-use tracing::warn;
+use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::util::SubscriberInitExt as _;
 
+mod api;
 mod schemas;
 
-static AUTOMOWER_CONNECT_API_BASE: &str = "https://api.amc.husqvarna.dev/v1";
 static BATTERY_NODE_ID: HomieID = HomieID::new_const("battery");
 static BATTERY_LEVEL_PROP_ID: HomieID = HomieID::new_const("level");
 static POSITION_NODE_ID: HomieID = HomieID::new_const("position");
@@ -53,6 +44,22 @@ static PLANNER_EXTERNAL_REASON_PROP_ID: HomieID = HomieID::new_const("external-r
 static SETTINGS_NODE_ID: HomieID = HomieID::new_const("settings");
 static SETTINGS_CUTTING_HEIGHT_PROP_ID: HomieID = HomieID::new_const("cutting-height");
 static SETTINGS_HEADLIGHT_PROP_ID: HomieID = HomieID::new_const("headlight-mode");
+static WORK_AREA_ID_PROP_ID: HomieID = HomieID::new_const("id");
+static WORK_AREA_NAME_PROP_ID: HomieID = HomieID::new_const("name");
+static WORK_AREA_TYPE_PROP_ID: HomieID = HomieID::new_const("type");
+static WORK_AREA_CUTTING_HEIGHT_PROP_ID: HomieID = HomieID::new_const("cutting-height");
+static WORK_AREA_ENABLED_PROP_ID: HomieID = HomieID::new_const("enabled");
+static WORK_AREA_SCHEDULABLE_PROP_ID: HomieID = HomieID::new_const("schedulable");
+static WORK_AREA_ORIENTATION_PROP_ID: HomieID = HomieID::new_const("orientation");
+static WORK_AREA_ORIENTATION_SHIFT_PROP_ID: HomieID = HomieID::new_const("orientation-shift");
+static WORK_AREA_CURRENT_ORIENTATION_PROP_ID: HomieID = HomieID::new_const("current-orientation");
+static WORK_AREA_OVERLAP_PROP_ID: HomieID = HomieID::new_const("overlap");
+static WORK_AREA_PROGRESS_PROP_ID: HomieID = HomieID::new_const("progress");
+static WORK_AREA_LAST_TIME_COMPLETED_PROP_ID: HomieID = HomieID::new_const("last-time-completed");
+static WORK_AREA_LAST_TIME_ABANDONED_PROP_ID: HomieID = HomieID::new_const("last-time-abandoned");
+static WORK_AREA_USE_GLOBAL_CUTTING_HEIGHT_PROP_ID: HomieID =
+    HomieID::new_const("use-global-cutting-height");
+static WORK_AREA_CALENDAR_PROP_ID: HomieID = HomieID::new_const("calendar");
 
 const USER_AGENT: &str = concat!(
     env!("CARGO_PKG_NAME"),
@@ -64,7 +71,7 @@ const USER_AGENT: &str = concat!(
 );
 const CONNECT_TIMEOUT: Duration = Duration::new(10, 0);
 const API_REQUEST_TIMEOUT: Duration = Duration::new(20, 0);
-const TOKEN_EXPIRATION_HEADROOM: Duration = Duration::new(30, 0);
+const PROPERTY_TARGET_TIMEOUT: Duration = Duration::from_secs(40);
 
 #[derive(Clone, Debug)]
 struct ExternalInhibit {
@@ -169,38 +176,22 @@ enum Error {
     GenerateSubscribtions(#[source] homie5::Homie5ProtocolError),
     #[error("could not subscribe to the homie properties")]
     Subscribe(#[source] rumqttc::v5::ClientError),
-    #[error("could not make a request to the `GET {1}` API endpoint")]
-    GetApi(#[source] reqwest::Error, &'static str),
-    #[error("could not make a request to the `POST {1}` API endpoint")]
-    PostApi(#[source] reqwest::Error, String),
-    #[error("could not read the API response for `GET {1}`")]
-    ReadGetResponse(#[source] reqwest::Error, &'static str),
-    #[error("could not read the API response for `POST {1}`")]
-    ReadPostResponse(#[source] reqwest::Error, String),
-    #[error("could not publish value to `{0}/{1}`")]
-    PublishValue(
-        #[source] rumqttc::v5::ClientError,
-        &'static HomieID,
-        &'static HomieID,
-    ),
+    #[error(transparent)]
+    Api(#[from] api::Error),
+    #[error("could not publish value to `{1}/{2}`")]
+    PublishValue(#[source] rumqttc::v5::ClientError, HomieID, HomieID),
     #[error("could not publish value to `{0}/{1}/$target`")]
-    PublishTarget(
-        #[source] rumqttc::v5::ClientError,
-        &'static HomieID,
-        &'static HomieID,
-    ),
-    #[error("an error in websocket")]
-    Websocket(#[source] tungstenite::Error),
+    PublishTarget(#[source] rumqttc::v5::ClientError, HomieID, HomieID),
     #[error("could not join the monitor thread")]
     MonitorJoin(#[source] tokio::task::JoinError),
+    #[error("could not join the API client task")]
+    ApiJoin(#[source] tokio::task::JoinError),
+    #[error("API client stopped unexpectedly")]
+    ApiStopped,
     #[error("disconnected from the MQTT server")]
     MqttDisconnect,
-    #[error("received MQTT message {1:?} with a non-utf8 topic; this should never happen")]
-    NonUtf8Topic(#[source] Utf8Error, Publish),
-    #[error("received an invalid MQTT command {1:?}")]
-    InvalidCommand(homie5::Homie5ProtocolError, Publish),
-    #[error("received an unexpected MQTT command {0:?}")]
-    UnexpectedMqttCommand(Publish),
+    #[error("Homie property task `{0}/{1}/{2}` has stopped")]
+    PropertyTaskStopped(String, String, String),
 }
 
 fn main() {
@@ -242,11 +233,6 @@ fn setup_and_run(args: Args) -> Result<(), Error> {
         .https_only(true)
         .build()
         .expect("TODO");
-    let state = State {
-        token: Default::default(),
-        token_expiration: boot_time::Instant::now(),
-        mowers: Default::default(),
-    };
     let (protocol, lw) = Homie5DeviceProtocol::new(args.device_name, homie5::HomieDomain::Default);
     let mut mqtt_options =
         MqttOptions::parse_url(&args.mqtt_broker).map_err(Error::ParseMqttBroker)?;
@@ -257,251 +243,106 @@ fn setup_and_run(args: Args) -> Result<(), Error> {
     mqtt_options.set_last_will(lw);
     let (mqtt, mqtt_loop) = rumqttc::v5::AsyncClient::new(mqtt_options, 100);
     let context = Arc::new(Context {
-        client,
-        state: Mutex::new(state),
+        api: Arc::new(api::Client::new(client, args.app_key, args.app_secret)),
+        mowers: Default::default(),
         protocol,
         mqtt,
-        app_key: args.app_key,
-        app_secret: args.app_secret,
-        external_inhibits: args.external_inhibit,
+        external_inhibits: args.external_inhibit.into(),
+        property_inputs: Default::default(),
     });
     runtime.block_on(context.run(mqtt_loop))
 }
 
-struct MowerState {
-    homie_status: HomieDeviceStatus,
-    battery_percent: u8,
-    latitude: Option<f64>,
-    longitude: Option<f64>,
-    mower_mode: String,
-    mower_activity: String,
-    mower_inactive_reason: Option<String>,
-    mower_state: String,
-    work_area_id: Option<i64>,
-    error_code: Option<u16>,
-    error_code_timestamp: Option<u64>,
-    is_error_confirmable: Option<bool>,
-    planner_external_reason: Option<i32>,
-    planner_restricted_reason: String,
-    planner_next_start: u64,
-    planner_override: Option<String>,
-    cutting_height: Option<u8>,
-    headlight_mode: Option<String>,
+enum PropertyTaskMessage {
+    Set(String),
+    Publish(oneshot::Sender<Result<(), Error>>),
+    Erase(oneshot::Sender<Result<(), Error>>),
 }
 
+type PropertyKey = (String, String, String);
+type PropertyTaskSender = mpsc::UnboundedSender<PropertyTaskMessage>;
+type PropertyInputs = Arc<Mutex<BTreeMap<PropertyKey, PropertyTaskSender>>>;
+
 struct MowerContext {
-    _client: reqwest::Client,
+    api: Arc<api::Mower>,
+    api_client: Arc<api::Client>,
+    external_inhibits: Arc<[ExternalInhibit]>,
     mqtt: rumqttc::v5::AsyncClient,
     protocol: Homie5DeviceProtocol,
     description: HomieDeviceDescription,
-    _root_id: HomieID,
-    api_id: String,
-    data: Arc<Mutex<MowerState>>,
+    status: HomieDeviceStatus,
+    property_ready: watch::Sender<bool>,
+    property_inputs: PropertyInputs,
 }
 
-struct State {
-    token: Arc<str>,
-    token_expiration: boot_time::Instant,
-    mowers: BTreeMap<String, MowerContext>,
+/// Owns everything about a single Homie property: the deduplication of published values, the
+/// `$target` lifecycle and the handling of the `set` commands.
+struct PropertyTask {
+    api: Arc<api::Mower>,
+    api_client: Arc<api::Client>,
+    external_inhibits: Arc<[ExternalInhibit]>,
+    mqtt: rumqttc::v5::AsyncClient,
+    protocol: Homie5DeviceProtocol,
+    node_id: HomieID,
+    prop_id: HomieID,
+    settable: bool,
+    retained: bool,
+    inputs: mpsc::UnboundedReceiver<PropertyTaskMessage>,
+    api_changes: watch::Receiver<u64>,
+    ready: watch::Receiver<bool>,
+    last_value: Option<Option<String>>,
+    last_target: Option<Option<String>>,
+    pending_target: Option<PendingTarget>,
+}
+
+/// A value that was requested through `set` and that the API is yet to report.
+struct PendingTarget {
+    /// The payload exactly as received, which is what `$target` has to be.
+    requested: String,
+    /// What the property is going to read once the API reflects the request.
+    expected: String,
+    deadline: tokio::time::Instant,
+    /// Has the API poll for the change for as long as the target is pending.
+    _wait: Option<api::WorkAreaWait>,
 }
 
 struct Context {
-    client: reqwest::Client,
-    state: Mutex<State>,
+    api: Arc<api::Client>,
+    mowers: Mutex<BTreeMap<String, Arc<Mutex<MowerContext>>>>,
     protocol: Homie5DeviceProtocol,
     mqtt: rumqttc::v5::AsyncClient,
-    app_key: String,
-    app_secret: String,
-    external_inhibits: Vec<ExternalInhibit>,
+    external_inhibits: Arc<[ExternalInhibit]>,
+    property_inputs: PropertyInputs,
 }
 
 impl Context {
-    async fn get_token(&self) -> Result<Arc<str>, Error> {
-        let now = boot_time::Instant::now();
-        {
-            let state = self.state.lock().await;
-            if state.token_expiration > now {
-                return Ok(Arc::clone(&state.token));
-            }
-        }
-        let request = self
-            .client
-            .post("https://api.authentication.husqvarnagroup.dev/v1/oauth2/token")
-            .header("accept", "application/json")
-            .form(&[
-                ("grant_type", "client_credentials"),
-                ("client_id", &self.app_key),
-                ("client_secret", &self.app_secret),
-            ])
-            .build()
-            .expect("TODO");
-        let response = self
-            .client
-            .execute(request)
-            .await
-            .expect("TODO")
-            .json::<schemas::oauth::TokenResponse>()
-            .await
-            .expect("TODO");
-
-        let mut state = self.state.lock().await;
-        state.token = response.access_token.into();
-        let token_duration =
-            Duration::from_secs_f32(response.expires_in).saturating_sub(TOKEN_EXPIRATION_HEADROOM);
-        state.token_expiration = boot_time::Instant::now()
-            .checked_add(token_duration)
-            .expect("TODO");
-        Ok(Arc::clone(&state.token))
-    }
-
-    async fn update_mower_data(&self) -> Result<Vec<MowerContext>, Error> {
-        let token = self.get_token().await?;
-        let response = self
-            .client
-            .get(format!("{AUTOMOWER_CONNECT_API_BASE}/mowers"))
-            .header("accept", "application/vnd.api+json")
-            .header("x-api-key", &self.app_key)
-            .header("authorization", format!("Bearer {token}"))
-            .header("authorization-provider", "husqvarna")
-            .send()
-            .await
-            .map_err(|e| Error::GetApi(e, "/mowers"))?;
-        let response = response
-            .json::<schemas::automower::JsonApiDataListDocument>()
-            .await
-            .map_err(|e| Error::ReadGetResponse(e, "/mowers"))?;
-        tracing::debug!(?response, uri = "/mowers", method = "GET");
-        let mut result = Vec::with_capacity(response.data.len());
-        for datum in response.data {
-            if "mower" != datum.r#type {
-                continue;
-            }
-            result.push(
-                MowerContext::new(
-                    datum.id,
-                    datum.attributes,
-                    self.client.clone(),
-                    self.mqtt.clone(),
-                    &self.protocol,
-                    &self.external_inhibits
-                )
-                .await,
-            );
-        }
-        Ok(result)
-    }
-
-    async fn monitor(self: Arc<Self>) -> Error {
-        'reconnect: loop {
-            let token = match self.get_token().await {
-                Ok(t) => t,
-                Err(e) => break 'reconnect e,
-            };
-            let mut request = "wss://ws.openapi.husqvarna.dev/v1"
-                .into_client_request()
-                .expect("TODO");
-            let headers = request.headers_mut();
-            headers.insert("x-api-key", self.app_key.parse().expect("TODO"));
-            headers.insert("authorization", format!("Bearer {token}").parse().unwrap());
-            headers.insert("authorization-provider", "husqvarna".parse().unwrap());
-            let (mut stream, _response) = tokio_tungstenite::connect_async(request).await.unwrap();
-            debug!(response = ?_response, "connected");
-            let mut ping_timer = tokio::time::interval(Duration::from_secs(10));
-            loop {
-                tokio::select! {
-                    result = stream.next() => {
-                        let Some(result) = result else {
-                            continue 'reconnect;
-                        };
-                        debug!(websocket_message=?result, "received a websocket message");
-                        let message: Result<schemas::websocket::Event ,_> = match result {
-                            Ok(tungstenite::Message::Text(text)) => {
-                                let event = serde_json::from_str(&text);
-                                if event.is_err() {
-                                    let conn_evt: Result<schemas::websocket::ConnectionEvent, _> =
-                                        serde_json::from_str(&text);
-                                    if conn_evt.is_ok() {
-                                        continue;
-                                    }
-                                }
-                                event
-                            },
-                            Ok(tungstenite::Message::Binary(bytes)) => {
-                                serde_json::from_slice(&bytes)
-                            },
-                            Ok(tungstenite::Message::Ping(payload)) => {
-                                stream.feed(
-                                    tungstenite::Message::Pong(payload)
-                                ).await.expect("TODO");
-                                continue;
-                            },
-                            Ok(tungstenite::Message::Pong(_)) => {
-                                debug!("got a pong!");
-                                continue;
-                            },
-                            Ok(tungstenite::Message::Close(_)) => continue 'reconnect,
-                            Err(tungstenite::Error::Protocol(_)) => continue 'reconnect,
-                            Ok(tungstenite::Message::Frame(_)) => unreachable!(),
-                            Err(err) => break 'reconnect Error::Websocket(err),
-                        };
-                        let event = match message {
-                            Ok(event) => event,
-                            Err(e) => {
-                                warn!(
-                                    error = &e as &dyn std::error::Error,
-                                    "could not deserialize a websocket message"
-                                );
-                                continue;
-                            }
-                        };
-                        let guard = self.state.lock().await;
-                        let id = match &event {
-                            schemas::websocket::Event::BatteryEventV2 { id, .. } |
-                            schemas::websocket::Event::CalendarEventV2 { id, .. } |
-                            schemas::websocket::Event::CuttingHeightEventV2 { id, .. } |
-                            schemas::websocket::Event::HeadlightsEventV2 { id, .. } |
-                            schemas::websocket::Event::MessageEventV2 { id, .. } |
-                            schemas::websocket::Event::MowerEventV2 { id, .. } |
-                            schemas::websocket::Event::PlannerEventV2 { id, .. } |
-                            schemas::websocket::Event::PositionEventV2 { id, .. } => id,
-                        };
-                        let key = MowerContext::id_to_key(id, &self.protocol);
-                        let Some(mower) = guard.mowers.get(&key) else {
-                            warn!(id, "received event for mower we don't know about, consider restarting?");
-                            continue;
-                        };
-                        if let Err(e) = mower.record_event(event, false).await {
-                            break 'reconnect e;
-                        }
-                    },
-                    _ = ping_timer.tick() => {
-                        debug!("sending ping");
-                        stream.feed(
-                            tungstenite::Message::Ping(
-                                Bytes::from_static(b"would be very nice of you to pong, thank you very much")
-                            )
-                        ).await.expect("TODO");
-                    },
-                }
-            }
-        }
-    }
-
-    async fn publish_root_device(&self) -> Result<(), Error> {
+    async fn publish_root_device(self: &Arc<Self>) -> Result<(), Error> {
         let mut root_description = DeviceDescriptionBuilder::new().name("Husqvarna Automowers");
         {
-            let mower_data = self.update_mower_data().await?;
-            let mut state = self.state.lock().await;
-            for mower in mower_data {
+            self.api.wait_initialized().await;
+            let api_mowers = self.api.mowers().await;
+            for mower in &api_mowers {
+                let child_id =
+                    HomieID::try_from(MowerContext::id_to_key(mower.id(), &self.protocol))
+                        .expect("known valid child device ID");
+                root_description = root_description.add_child(child_id);
+            }
+            // Stop the property tasks of the previous connection; they are bound to the previous
+            // `MowerContext`s.
+            self.property_inputs.lock().await.clear();
+            let mut mowers = self.mowers.lock().await;
+            for api_mower in api_mowers {
+                let mower = MowerContext::new(
+                    api_mower,
+                    Arc::clone(&self.api),
+                    self.mqtt.clone(),
+                    &self.protocol,
+                    Arc::clone(&self.external_inhibits),
+                    Arc::clone(&self.property_inputs),
+                )
+                .await;
                 let mower_id = mower.protocol.device_ref().device_id();
-                root_description = root_description.add_child(mower_id.clone());
-                let entry = state.mowers.entry(mower_id.to_string());
-                match entry {
-                    btree_map::Entry::Vacant(vacant) => vacant.insert(mower),
-                    btree_map::Entry::Occupied(_) => {
-                        todo!()
-                    }
-                };
+                mowers.insert(mower_id.to_string(), Arc::new(Mutex::new(mower)));
             }
         }
         let root_description = root_description.build();
@@ -539,6 +380,7 @@ impl Context {
     }
 
     async fn run(self: Arc<Self>, mut mqtt_loop: rumqttc::v5::EventLoop) -> Result<(), Error> {
+        let mut api_handle = tokio::spawn(Arc::clone(&self.api).run());
         let mut monitor_handle = None;
         loop {
             use rumqttc::Outgoing;
@@ -547,6 +389,13 @@ impl Context {
 
             let result = tokio::select! {
                 r = mqtt_loop.poll() => r,
+                api_result = &mut api_handle => {
+                    return match api_result {
+                        Ok(Err(error)) => Err(Error::Api(error)),
+                        Ok(Ok(())) => Err(Error::ApiStopped),
+                        Err(error) => Err(Error::ApiJoin(error)),
+                    };
+                },
                 join_result = async { monitor_handle.as_mut().unwrap().await }, if monitor_handle.is_some() => {
                     match join_result {
                         Ok(error) => return Err(error),
@@ -562,28 +411,37 @@ impl Context {
                         if let Err(e) = this.publish_root_device().await {
                             return e;
                         }
-                        {
-                            let state = this.state.lock().await;
-                            for mower in state.mowers.values() {
-                                if let Err(e) = mower.publish_device().await {
-                                    return e;
-                                };
+                        let mowers = this
+                            .mowers
+                            .lock()
+                            .await
+                            .values()
+                            .cloned()
+                            .collect::<Vec<_>>();
+                        for mower in &mowers {
+                            let mut mower = mower.lock().await;
+                            mower.ensure_property_tasks().await;
+                            if let Err(error) = mower.publish_device().await {
+                                return error;
                             }
                         }
-                        this.monitor().await
+                        let mut listeners = mowers
+                            .into_iter()
+                            .map(MowerContext::monitor_api_changes)
+                            .collect::<futures::stream::FuturesUnordered<_>>();
+                        while let Some(result) = listeners.next().await {
+                            if let Err(error) = result {
+                                return error;
+                            }
+                        }
+                        Error::ApiStopped
                     });
-                    monitor_handle = Some(joiner);
+                    if let Some(previous) = monitor_handle.replace(joiner) {
+                        previous.abort();
+                    }
                 }
                 Event::Incoming(Packet::Publish(msg)) => {
-                    let this = Arc::clone(&self);
-                    tokio::spawn(async move {
-                        if let Err(e) = this.handle_command(msg).await {
-                            tracing::error!(
-                                error = &e as &dyn std::error::Error,
-                                "error handling mqtt command"
-                            );
-                        }
-                    });
+                    self.route_property_input(msg).await;
                 }
                 Event::Outgoing(Outgoing::Disconnect) => {
                     return Err(Error::MqttDisconnect);
@@ -595,250 +453,640 @@ impl Context {
         }
     }
 
-    async fn handle_command(&self, msg: Publish) -> Result<(), Error> {
+    async fn route_property_input(&self, msg: Publish) {
         let topic = match std::str::from_utf8(&msg.topic) {
-            Err(e) => return Err(Error::NonUtf8Topic(e, msg)),
             Ok(topic) => topic,
+            Err(error) => {
+                tracing::warn!(%error, "received an MQTT publish with a non-UTF8 topic");
+                return;
+            }
         };
-        let (prop, val) = match homie5::parse_mqtt_message(topic, &msg.payload) {
+        let (property, value) = match homie5::parse_mqtt_message(topic, &msg.payload) {
             Ok(homie5::Homie5Message::PropertySet {
                 property,
                 set_value,
             }) => (property, set_value),
-            Err(e) => return Err(Error::InvalidCommand(e, msg)),
-            Ok(_) => return Err(Error::UnexpectedMqttCommand(msg)),
+            Ok(_) => {
+                tracing::trace!(%topic, "ignoring non-set MQTT publish");
+                return;
+            }
+            Err(error) => {
+                tracing::warn!(%topic, %error, "ignoring invalid MQTT property publish");
+                return;
+            }
         };
-        let state = self.state.lock().await;
-        let device_id = prop.device_id().as_str();
-        let node_id = prop.node_id();
-        let prop_id = prop.prop_id();
-        let Some(mower) = state.mowers.get(device_id) else {
-            tracing::warn!(%device_id, "command for an unknown mower");
-            return Ok(());
-        };
-        let Some(prop_description) = mower.description.get_property(prop.prop_pointer()) else {
-            tracing::error!(%node_id, %prop_id, "command for an unknown property");
-            return Ok(());
-        };
-        let mower_id = MowerContext::key_to_id(device_id, &self.protocol);
-        if !prop_description.settable {
-            tracing::error!(%node_id, %prop_id, "property not settable");
-            return Ok(());
+        let key = (
+            property.device_id().to_string(),
+            property.node_id().to_string(),
+            property.prop_id().to_string(),
+        );
+        let sender = self.property_inputs.lock().await.get(&key).cloned();
+        match sender {
+            Some(sender) if sender.send(PropertyTaskMessage::Set(value)).is_ok() => {}
+            Some(_) => tracing::warn!(?key, "Homie property task has stopped"),
+            None => tracing::warn!(?key, "MQTT set publish has no owning Homie property task"),
         }
-        drop(state);
-        match (node_id.as_str(), prop_id.as_str()) {
-            ("settings", "cutting-height") => {
-                let Ok(height) = val.parse::<i64>() else {
-                    tracing::error!(%node_id, %prop_id, %val, "cutting height value is not a number");
-                    return Ok(());
-                };
-                let body = serde_json::json!({ "data": {
-                    "type": "settings",
-                    "attributes": { "cuttingHeight": height }
-                }});
-                return self.set_setting(mower_id, body).await;
-            }
-            ("settings", "headlight-mode") => {
-                let body = serde_json::json!({ "data": {
-                    "type": "settings",
-                    "attributes": { "headlight": { "mode": val } }
-                }});
-                return self.set_setting(mower_id, body).await;
-            }
-            ("mower", "mowing") => match &*val {
-                "yes" => {
-                    let body = serde_json::json!({ "data": { "type": "ResumeSchedule" } });
-                    self.mower_action(mower_id, body).await?;
-                    self.publish_target(device_id, &MOWER_NODE_ID, &MOWER_MOWING_PROP_ID, val)
-                        .await?;
-                    return Ok(());
-                }
-                "no" => {
-                    let body = serde_json::json!({ "data": { "type": "Pause" } });
-                    self.mower_action(mower_id, body).await?;
-                    self.publish_target(device_id, &MOWER_NODE_ID, &MOWER_MOWING_PROP_ID, val)
-                        .await?;
-                    return Ok(());
-                }
-                "forced-for-duration" | "forced-in-workarea" => {
-                    // TODO: figure out parameters.
-                    return Ok(());
-                }
-                _ => return Ok(()),
-            },
-            ("mower", "parked") => match &*val {
-                "yes" => {
-                    let body = serde_json::json!({ "data": { "type": "ParkUntilFurtherNotice" } });
-                    self.mower_action(mower_id, body).await?;
-                    self.publish_target(device_id, &MOWER_NODE_ID, &MOWER_PARKED_PROP_ID, val)
-                        .await?;
-                    return Ok(());
-                }
-                "until-next-schedule" => {
-                    let body = serde_json::json!({ "data": { "type": "ParkUntilNextSchedule" } });
-                    self.mower_action(mower_id, body).await?;
-                    self.publish_target(device_id, &MOWER_NODE_ID, &MOWER_PARKED_PROP_ID, val)
-                        .await?;
-                    return Ok(());
-                }
-                "no" => {
-                    let body = serde_json::json!({ "data": { "type": "ResumeSchedule" } });
-                    self.mower_action(mower_id, body).await?;
-                    self.publish_target(device_id, &MOWER_NODE_ID, &MOWER_PARKED_PROP_ID, val)
-                        .await?;
-                    return Ok(());
-                }
-                "for-duration" => {
-                    // TODO: figure out how to pass parameters.
-                    return Ok(());
-                }
-                _ => return Ok(()),
-            },
-            ("mower", "paused") => match &*val {
-                "true" => {
-                    let body = serde_json::json!({ "data": { "type": "Pause" } });
-                    self.mower_action(mower_id, body).await?;
-                    self.publish_target(device_id, &MOWER_NODE_ID, &MOWER_PAUSED_PROP_ID, val)
-                        .await?;
-                    return Ok(());
-                }
-                "false" => {
-                    let body = serde_json::json!({ "data": { "type": "ResumeSchedule" } });
-                    self.mower_action(mower_id, body).await?;
-                    self.publish_target(device_id, &MOWER_NODE_ID, &MOWER_PAUSED_PROP_ID, val)
-                        .await?;
-                    return Ok(());
-                }
-                _ => return Ok(()),
-            },
-            ("planner", prop_id) => {
-                let Some(inhibit) = self
-                    .external_inhibits
-                    .iter()
-                    .find(|inhibit| inhibit.name.as_str() == prop_id)
-                else {
-                    unreachable!()
-                };
-                let duration = match &*val {
-                    "enable" => inhibit.duration_minutes,
-                    "disable" => 1,
-                    _ => {
-                        tracing::error!(%node_id, %prop_id, %val, "invalid external inhibit command");
-                        return Ok(());
-                    }
-                };
-                let data = serde_json::json!({"data": {
-                    "type": "Park",
-                    "attributes": {
-                        "duration": duration,
-                        "externalReason": inhibit.reason
-                    }
-                }});
-                return self.post_api(mower_id, "actions", data).await;
-            }
+    }
+}
 
-            (_, _) => {
-                unreachable!()
+impl PropertyTask {
+    async fn run(mut self) {
+        tracing::debug!(node_id = %self.node_id, prop_id = %self.prop_id, "started Homie property task");
+        loop {
+            let deadline = self.pending_target.as_ref().map(|pending| pending.deadline);
+            let result = tokio::select! {
+                message = self.inputs.recv() => match message {
+                    Some(message) => self.handle_message(message).await,
+                    None => break,
+                },
+                changed = self.api_changes.changed() => {
+                    if changed.is_err() { break; }
+                    self.publish_api_state().await
+                },
+                ready = self.ready.changed() => {
+                    if ready.is_err() { break; }
+                    self.publish_api_state().await
+                },
+                _ = async {
+                    match deadline {
+                        Some(deadline) => tokio::time::sleep_until(deadline).await,
+                        None => futures::future::pending().await,
+                    }
+                } => self.expire_target().await,
+            };
+            if let Err(error) = result {
+                tracing::error!(
+                    error = &error as &dyn std::error::Error,
+                    node_id = %self.node_id,
+                    prop_id = %self.prop_id,
+                    "error in Homie property task"
+                );
+            }
+        }
+        tracing::debug!(node_id = %self.node_id, prop_id = %self.prop_id, "stopped Homie property task");
+    }
+
+    async fn handle_message(&mut self, message: PropertyTaskMessage) -> Result<(), Error> {
+        match message {
+            PropertyTaskMessage::Set(value) => self.set(&value).await,
+            PropertyTaskMessage::Publish(reply) => {
+                let _ = reply.send(self.publish_all().await);
+                Ok(())
+            }
+            PropertyTaskMessage::Erase(reply) => {
+                let _ = reply.send(self.erase().await);
+                Ok(())
             }
         }
     }
 
-    async fn post_api(
-        &self,
-        mower_id: &str,
-        command: &str,
-        body: serde_json::Value,
-    ) -> Result<(), Error> {
-        let token = self.get_token().await?;
-        let response = self
-            .client
-            .post(format!(
-                "{AUTOMOWER_CONNECT_API_BASE}/mowers/{mower_id}/{command}"
-            ))
-            .header("accept", "application/vnd.api+json")
-            .header("content-type", "application/vnd.api+json")
-            .header("x-api-key", &self.app_key)
-            .header("authorization", format!("Bearer {token}"))
-            .header("authorization-provider", "husqvarna")
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| Error::PostApi(e, format!("/mowers/{mower_id}/{command}")))?;
-        let code = response.status();
-        if !code.is_success() {
-            let response = response
-                .text()
+    async fn api_value(&self) -> Option<String> {
+        let snapshot = self.api.snapshot().await;
+        homie_property_value(
+            &snapshot,
+            self.node_id.as_str(),
+            self.prop_id.as_str(),
+            &self.external_inhibits,
+        )
+    }
+
+    /// Forward the command to the API and start waiting for the API to report the new value.
+    async fn set(&mut self, value: &str) -> Result<(), Error> {
+        if !self.settable {
+            tracing::error!(node_id = %self.node_id, prop_id = %self.prop_id, "property not settable");
+            return Ok(());
+        }
+        let Some(command) = parse_set(
+            &self.external_inhibits,
+            self.node_id.as_str(),
+            self.prop_id.as_str(),
+            value,
+        ) else {
+            return self.reject().await;
+        };
+        // The command is accepted, so `$target` goes first, then the request that starts the
+        // transition is made.
+        let previous = self.pending_target.replace(PendingTarget {
+            requested: value.to_owned(),
+            expected: command.expected.clone(),
+            deadline: tokio::time::Instant::now() + PROPERTY_TARGET_TIMEOUT,
+            _wait: None,
+        });
+        let sent = async {
+            if *self.ready.borrow() {
+                self.publish_target(Some(value.to_owned()), false).await?;
+            }
+            command
+                .request
+                .send(&self.api_client, self.api.id())
                 .await
-                .map_err(|e| Error::ReadPostResponse(e, format!("/mowers/{mower_id}/{command}")))?;
-            tracing::error!(
-                ?response,
-                uri = "/mowers/{mower_id}/{command}",
-                mower_id,
-                command,
-                method = "POST"
-            );
-        } else {
-            let response = response
-                .json::<serde_json::Value>()
-                .await
-                .map_err(|e| Error::ReadPostResponse(e, format!("/mowers/{mower_id}/{command}")))?;
-            tracing::debug!(
-                ?response,
-                uri = "/mowers/{mower_id}/{command}",
-                mower_id,
-                command,
-                method = "POST"
-            );
+                .map_err(Error::from)
+        }
+        .await;
+        if let Err(error) = sent {
+            // Whatever was being waited for before is still the target.
+            self.pending_target = previous;
+            if let Err(error) = self.reject().await {
+                tracing::error!(
+                    error = &error as &dyn std::error::Error,
+                    node_id = %self.node_id,
+                    prop_id = %self.prop_id,
+                    "could not publish the rejection of a command"
+                );
+            }
+            return Err(error);
+        }
+        // Work areas are not covered by the websocket, so have the API poll for the change.
+        let wait = parse_work_area_node_id(self.node_id.as_str()).map(|_| {
+            let (node_id, prop_id) = (self.node_id.clone(), self.prop_id.clone());
+            let external_inhibits = Arc::clone(&self.external_inhibits);
+            let expected = Some(command.expected);
+            self.api.wait_for(move |data| {
+                homie_property_value(data, node_id.as_str(), prop_id.as_str(), &external_inhibits)
+                    == expected
+            })
+        });
+        if let Some(pending) = &mut self.pending_target {
+            pending.deadline = tokio::time::Instant::now() + PROPERTY_TARGET_TIMEOUT;
+            pending._wait = wait;
         }
         Ok(())
     }
 
-    async fn set_setting(&self, mower_id: &str, json: serde_json::Value) -> Result<(), Error> {
-        self.post_api(mower_id, "settings", json).await
+    /// Tell controllers that a command was not accepted by publishing the unchanged target again.
+    async fn reject(&mut self) -> Result<(), Error> {
+        if !*self.ready.borrow() {
+            return Ok(());
+        }
+        let target = match &self.pending_target {
+            Some(pending) => Some(pending.requested.clone()),
+            None => self.api_value().await,
+        };
+        self.publish_target(target, true).await
     }
 
-    async fn mower_action(&self, mower_id: &str, json: serde_json::Value) -> Result<(), Error> {
-        self.post_api(mower_id, "actions", json).await
+    /// Publish what the API currently reports, unless that is what is already published.
+    async fn publish_api_state(&mut self) -> Result<(), Error> {
+        if !*self.ready.borrow() {
+            return Ok(());
+        }
+        let value = self.api_value().await;
+        if self.settable {
+            // `$target` is published ahead of the value it announces. Once the API reports what was
+            // asked for, `$target` is left as it is: the value is only functionally equivalent
+            // (e.g. `20.0` for `20`), which is fine for the value, but not a new target.
+            // `None` means leaving `$target` as it is.
+            let target = match &self.pending_target {
+                Some(pending) if value.as_ref() == Some(&pending.expected) => {
+                    self.pending_target = None;
+                    None
+                }
+                Some(pending) => Some(Some(pending.requested.clone())),
+                None if self.last_value.as_ref() != Some(&value) => Some(value.clone()),
+                None => None,
+            };
+            if let Some(target) = target {
+                self.publish_target(target, false).await?;
+            }
+        }
+        self.publish_value(value, false).await
     }
 
-    async fn publish_target(
-        &self,
-        device_id: &str,
-        node_id: &'static HomieID,
-        prop_id: &'static HomieID,
-        target: impl Into<String>,
-    ) -> Result<(), Error> {
-        let protocol = self.protocol.clone_for_child(
-            HomieID::try_from(device_id.to_owned()).expect("known valid homie device id"),
+    /// Give up waiting for the API to reach the requested target.
+    async fn expire_target(&mut self) -> Result<(), Error> {
+        self.pending_target = None;
+        if !*self.ready.borrow() {
+            return Ok(());
+        }
+        let value = self.api_value().await;
+        self.publish_target(value.clone(), false).await?;
+        self.publish_value(value, false).await
+    }
+
+    async fn publish_all(&mut self) -> Result<(), Error> {
+        let value = self.api_value().await;
+        if self.settable {
+            let target = match (&self.pending_target, &self.last_value, &self.last_target) {
+                (Some(pending), ..) => Some(pending.requested.clone()),
+                // Nothing changed since the last time; keep the target the way it was.
+                (None, Some(last_value), Some(last_target)) if *last_value == value => {
+                    last_target.clone()
+                }
+                (None, ..) => value.clone(),
+            };
+            self.publish_target(target, false).await?;
+        }
+        self.publish_value(value, true).await
+    }
+
+    async fn erase(&mut self) -> Result<(), Error> {
+        if self.settable {
+            self.publish_target(None, false).await?;
+        }
+        self.publish_value(None, false).await
+    }
+
+    async fn publish_value(&mut self, value: Option<String>, force: bool) -> Result<(), Error> {
+        if !force && self.last_value.as_ref() == Some(&value) {
+            return Ok(());
+        }
+        let mut publish = self.protocol.publish_value(
+            &self.node_id,
+            &self.prop_id,
+            value.clone().unwrap_or_default(),
+            self.retained,
         );
-        let p = protocol.publish_target(node_id, prop_id, target, true);
-        self.mqtt
-            .homie_publish(p)
-            .await
-            .map_err(|e| Error::PublishTarget(e, node_id, prop_id))?;
+        if value.is_none() {
+            publish.payload.clear();
+        }
+        self.mqtt.homie_publish(publish).await.map_err(|error| {
+            Error::PublishValue(error, self.node_id.clone(), self.prop_id.clone())
+        })?;
+        self.last_value = Some(value);
+        Ok(())
+    }
+
+    async fn publish_target(&mut self, target: Option<String>, force: bool) -> Result<(), Error> {
+        if !force && self.last_target.as_ref() == Some(&target) {
+            return Ok(());
+        }
+        let clear = target.is_none();
+        let mut publish = self.protocol.publish_target(
+            &self.node_id,
+            &self.prop_id,
+            target.clone().unwrap_or_default(),
+            clear || self.retained,
+        );
+        if clear {
+            publish.payload.clear();
+        }
+        self.mqtt.homie_publish(publish).await.map_err(|error| {
+            Error::PublishTarget(error, self.node_id.clone(), self.prop_id.clone())
+        })?;
+        self.last_target = Some(target);
         Ok(())
     }
 }
 
+/// A validated `set` command, ready to be sent to the API.
+struct SetCommand {
+    /// What the property is going to read once the API reflects the command.
+    expected: String,
+    request: SetRequest,
+}
+
+enum SetRequest {
+    /// `POST /mowers/{id}/{path}`
+    Post {
+        path: String,
+        body: serde_json::Value,
+    },
+    PatchWorkArea {
+        work_area_id: i64,
+        attributes: serde_json::Value,
+    },
+}
+
+impl SetRequest {
+    async fn send(self, api_client: &api::Client, mower_id: &str) -> Result<(), api::Error> {
+        match self {
+            SetRequest::Post { path, body } => api_client.post_mower(mower_id, &path, body).await,
+            SetRequest::PatchWorkArea {
+                work_area_id,
+                attributes,
+            } => {
+                api_client
+                    .patch_work_area(mower_id, work_area_id, attributes)
+                    .await
+            }
+        }
+    }
+}
+
+/// Validate a `set` command and work out the API request that carries it out.
+///
+/// Returns `None` if the command is invalid or not supported, in which case it must not be
+/// accepted.
+fn parse_set(
+    external_inhibits: &[ExternalInhibit],
+    node_id: &str,
+    prop_id: &str,
+    val: &str,
+) -> Option<SetCommand> {
+    if let Some(work_area_id) = parse_work_area_node_id(node_id) {
+        if prop_id == "calendar" {
+            let Ok(mut tasks) = serde_json::from_str::<Vec<schemas::automower::CalendarTask>>(val)
+            else {
+                tracing::error!(%node_id, %val, "work area calendar does not match the expected schema");
+                return None;
+            };
+            if tasks
+                .iter()
+                .any(|task| task.start > 1439 || !(1..=1440).contains(&task.duration))
+            {
+                tracing::error!(%node_id, "work area calendar tasks contain invalid time ranges");
+                return None;
+            }
+            // Same representation as `homie_property_value`, so that the target can be compared.
+            for task in &mut tasks {
+                task.work_area_id = None;
+            }
+            let expected = serde_json::to_string(&tasks).expect("calendar schema is serializable");
+            for task in &mut tasks {
+                task.work_area_id = Some(work_area_id);
+            }
+            return Some(SetCommand {
+                expected,
+                request: SetRequest::Post {
+                    path: format!("workAreas/{work_area_id}/calendar"),
+                    body: serde_json::json!({ "data": {
+                        "type": "calendar",
+                        "attributes": schemas::automower::CalendarWorkArea { tasks }
+                    }}),
+                },
+            });
+        }
+        let (attributes, expected) = match prop_id {
+            "name" => {
+                if val.chars().count() > 32 {
+                    tracing::error!(%node_id, "work area name exceeds 32 characters");
+                    return None;
+                }
+                (serde_json::json!({ "name": val }), val.to_owned())
+            }
+            "cutting-height" => {
+                let Ok(value) = val.parse::<u8>() else {
+                    tracing::error!(%node_id, %val, "work area cutting height is not an integer");
+                    return None;
+                };
+                if value > 100 {
+                    tracing::error!(%node_id, %val, "work area cutting height must be in the range 0-100");
+                    return None;
+                }
+                (
+                    serde_json::json!({ "cuttingHeight": value }),
+                    value.to_string(),
+                )
+            }
+            "enabled" => {
+                let Ok(value) = val.parse::<bool>() else {
+                    tracing::error!(%node_id, %val, "work area enabled value is not a boolean");
+                    return None;
+                };
+                (serde_json::json!({ "enable": value }), value.to_string())
+            }
+            "orientation" | "orientation-shift" => {
+                let Ok(degrees) = val.parse::<f64>() else {
+                    tracing::error!(%node_id, %prop_id, %val, "work area orientation is not a number");
+                    return None;
+                };
+                if !(0.0..=180.0).contains(&degrees) {
+                    tracing::error!(%node_id, %prop_id, %val, "work area orientation must be in the range 0-180 degrees");
+                    return None;
+                }
+                let tenths = (degrees * 10.0).round() as u16;
+                let key = if prop_id == "orientation" {
+                    "orientation"
+                } else {
+                    "orientationShift"
+                };
+                (
+                    serde_json::json!({ key: tenths }),
+                    mower_degrees_tenths(tenths),
+                )
+            }
+            _ => {
+                tracing::error!(%node_id, %prop_id, "work area property not settable");
+                return None;
+            }
+        };
+        return Some(SetCommand {
+            expected,
+            request: SetRequest::PatchWorkArea {
+                work_area_id,
+                attributes,
+            },
+        });
+    }
+    let (path, body, expected) = match (node_id, prop_id) {
+        ("settings", "cutting-height") => {
+            let Ok(height) = val.parse::<i64>() else {
+                tracing::error!(%node_id, %prop_id, %val, "cutting height value is not a number");
+                return None;
+            };
+            let body = serde_json::json!({ "data": {
+                "type": "settings",
+                "attributes": { "cuttingHeight": height }
+            }});
+            ("settings", body, height.to_string())
+        }
+        ("settings", "headlight-mode") => {
+            let body = serde_json::json!({ "data": {
+                "type": "settings",
+                "attributes": { "headlight": { "mode": val } }
+            }});
+            ("settings", body, val.to_owned())
+        }
+        ("mower", "mowing" | "parked" | "paused") => {
+            let action = match (prop_id, val) {
+                ("mowing", "yes") | ("parked", "no") | ("paused", "false") => "ResumeSchedule",
+                ("mowing", "no") | ("paused", "true") => "Pause",
+                ("parked", "yes") => "ParkUntilFurtherNotice",
+                ("parked", "until-next-schedule") => "ParkUntilNextSchedule",
+                ("mowing", "forced-for-duration" | "forced-in-workarea")
+                | ("parked", "for-duration") => {
+                    // TODO: figure out how to pass parameters.
+                    tracing::warn!(%node_id, %prop_id, %val, "value not supported yet");
+                    return None;
+                }
+                _ => {
+                    tracing::error!(%node_id, %prop_id, %val, "invalid value");
+                    return None;
+                }
+            };
+            let body = serde_json::json!({ "data": { "type": action } });
+            ("actions", body, val.to_owned())
+        }
+        ("planner", prop_id) => {
+            let Some(inhibit) = external_inhibits
+                .iter()
+                .find(|inhibit| inhibit.name.as_str() == prop_id)
+            else {
+                tracing::error!(%node_id, %prop_id, "unknown external inhibit");
+                return None;
+            };
+            let duration = match val {
+                "enable" => inhibit.duration_minutes,
+                "disable" => 1,
+                _ => {
+                    tracing::error!(%node_id, %prop_id, %val, "invalid external inhibit command");
+                    return None;
+                }
+            };
+            let body = serde_json::json!({ "data": {
+                "type": "Park",
+                "attributes": {
+                    "duration": duration,
+                    "externalReason": inhibit.reason
+                }
+            }});
+            ("actions", body, val.to_owned())
+        }
+        _ => {
+            tracing::error!(%node_id, %prop_id, "property not settable");
+            return None;
+        }
+    };
+    Some(SetCommand {
+        expected,
+        request: SetRequest::Post {
+            path: path.to_owned(),
+            body,
+        },
+    })
+}
+
 impl MowerContext {
+    async fn monitor_api_changes(mower: Arc<Mutex<Self>>) -> Result<(), Error> {
+        let api = Arc::clone(&mower.lock().await.api);
+        let mut changes = api.subscribe();
+        loop {
+            mower.lock().await.synchronize_from_api().await?;
+            if changes.changed().await.is_err() {
+                return Ok(());
+            }
+        }
+    }
+
+    async fn synchronize_from_api(&mut self) -> Result<(), Error> {
+        let data = self.api.snapshot().await;
+        let work_area_ids = data
+            .work_areas
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|area| area.work_area_id)
+            .collect();
+        self.update_work_areas(work_area_ids).await
+    }
+
+    async fn send_property_message(
+        &self,
+        node_id: &HomieID,
+        prop_id: &HomieID,
+        message: impl FnOnce(oneshot::Sender<Result<(), Error>>) -> PropertyTaskMessage,
+    ) -> Result<(), Error> {
+        let key = (
+            self.protocol.device_ref().device_id().to_string(),
+            node_id.to_string(),
+            prop_id.to_string(),
+        );
+        let sender = self.property_inputs.lock().await.get(&key).cloned();
+        let Some(sender) = sender else {
+            return Err(Error::PropertyTaskStopped(key.0, key.1, key.2));
+        };
+        let (reply, result) = oneshot::channel();
+        sender
+            .send(message(reply))
+            .map_err(|_| Error::PropertyTaskStopped(key.0.clone(), key.1.clone(), key.2.clone()))?;
+        result
+            .await
+            .map_err(|_| Error::PropertyTaskStopped(key.0, key.1, key.2))?
+    }
+
+    async fn publish_all_properties(&self) -> Result<(), Error> {
+        let properties = self
+            .description
+            .iter()
+            .map(|(node, _, property, _)| (node.clone(), property.clone()))
+            .collect::<Vec<_>>();
+        for (node, property) in properties {
+            self.send_property_message(&node, &property, PropertyTaskMessage::Publish)
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn erase_property(&self, node_id: &HomieID, prop_id: &HomieID) -> Result<(), Error> {
+        self.send_property_message(node_id, prop_id, PropertyTaskMessage::Erase)
+            .await?;
+        self.property_inputs.lock().await.remove(&(
+            self.protocol.device_ref().device_id().to_string(),
+            node_id.to_string(),
+            prop_id.to_string(),
+        ));
+        Ok(())
+    }
+
+    /// Make the set of `work-area-*` nodes match `work_area_ids`.
+    ///
+    /// Per the Homie convention, a change to the description requires the device to go through
+    /// `init` before it becomes `ready` again, so the description gets republished from scratch.
+    async fn update_work_areas(&mut self, work_area_ids: BTreeSet<i64>) -> Result<(), Error> {
+        let old_ids = self
+            .description
+            .nodes
+            .keys()
+            .filter_map(|id| parse_work_area_node_id(id.as_str()))
+            .collect::<BTreeSet<_>>();
+        if old_ids == work_area_ids {
+            return Ok(());
+        }
+        let old_description = self.description.clone();
+        let mut description = old_description.clone();
+        description
+            .nodes
+            .retain(|id, _| parse_work_area_node_id(id.as_str()).is_none());
+        for id in &work_area_ids {
+            description
+                .nodes
+                .insert(work_area_node_id(*id), work_area_node_description());
+        }
+        description.update_version();
+        let removed_ids = old_ids
+            .difference(&work_area_ids)
+            .copied()
+            .collect::<Vec<_>>();
+        let old_status = self.status;
+        if old_status == HomieDeviceStatus::Ready {
+            self.status = HomieDeviceStatus::Init;
+            self.property_ready.send_replace(false);
+        }
+        self.description = description;
+        let result = self.republish(removed_ids).await;
+        if result.is_err() {
+            self.description = old_description;
+            self.status = old_status;
+            self.property_ready
+                .send_replace(old_status == HomieDeviceStatus::Ready);
+        }
+        result
+    }
+
+    async fn republish(&mut self, removed_ids: Vec<i64>) -> Result<(), Error> {
+        self.publish_device_state(self.status).await?;
+        for id in removed_ids {
+            self.clear_work_area_node(id).await?;
+        }
+        self.ensure_property_tasks().await;
+        self.publish_device().await
+    }
+
     fn id_to_key(id: &str, root_protocol: &Homie5DeviceProtocol) -> String {
         let root_id = root_protocol.device_ref().device_id();
         format!("{}-{}", root_id, id)
     }
 
-    fn key_to_id<'a>(key: &'a str, root_protocol: &Homie5DeviceProtocol) -> &'a str {
-        let root_id = root_protocol.device_ref().device_id();
-        &key[root_id.as_str().len() + 1..]
-    }
-
     async fn new(
-        api_id: String,
-        data: MowerData,
-        client: reqwest::Client,
+        api: Arc<api::Mower>,
+        api_client: Arc<api::Client>,
         mqtt: rumqttc::v5::AsyncClient,
         root_protocol: &Homie5DeviceProtocol,
-        external_inhibits: &[ExternalInhibit],
+        external_inhibits: Arc<[ExternalInhibit]>,
+        property_inputs: PropertyInputs,
     ) -> Self {
+        let api_id = api.id().to_owned();
+        let data = api.snapshot().await;
+        let (property_ready, _) = watch::channel(false);
         let root_id = root_protocol.device_ref().device_id();
         let child_device_id = HomieID::try_from(Self::id_to_key(&api_id, root_protocol)).unwrap();
         let protocol = root_protocol.clone_for_child(child_device_id);
@@ -847,6 +1095,12 @@ impl MowerContext {
         } else {
             HomieDeviceStatus::Disconnected
         };
+        let work_area_ids = data
+            .work_areas
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|area| area.work_area_id)
+            .collect::<BTreeSet<_>>();
         let mut description = DeviceDescriptionBuilder::new()
             .name(data.system.name.clone())
             .root(root_id.clone())
@@ -977,7 +1231,7 @@ impl MowerContext {
                 PLANNER_RESTRICTED_REASON_PROP_ID.clone(),
                 restricted_reason_prop,
             );
-        for inhibit in external_inhibits {
+        for inhibit in external_inhibits.iter() {
             let prop = PropertyDescriptionBuilder::enumeration(["enable", "disable"])
                 .unwrap()
                 .settable(true)
@@ -1007,337 +1261,100 @@ impl MowerContext {
             .build();
         description = description.add_node(BATTERY_NODE_ID.clone(), battery_node);
         description = description.add_node(POSITION_NODE_ID.clone(), position_node);
+        for id in &work_area_ids {
+            description =
+                description.add_node(work_area_node_id(*id), work_area_node_description());
+        }
         description = description.add_node(MOWER_NODE_ID.clone(), mower_node);
         description = description.add_node(PLANNER_NODE_ID.clone(), planner_node);
         description = description.add_node(SETTINGS_NODE_ID.clone(), settings_node);
         let description = description.build();
         Self {
-            _client: client,
+            api,
+            api_client,
+            external_inhibits,
             mqtt,
             protocol,
             description,
-            _root_id: root_id.clone(),
-            api_id,
-            data: Arc::new(Mutex::new(MowerState {
-                homie_status: initial_state,
-                battery_percent: data.battery.battery_percent,
-                latitude: data
-                    .positions
-                    .as_ref()
-                    .and_then(|ps| ps.last())
-                    .and_then(|p| p.latitude),
-                longitude: data
-                    .positions
-                    .as_ref()
-                    .and_then(|ps| ps.last())
-                    .and_then(|p| p.longitude),
-                mower_mode: data.mower.mode,
-                mower_activity: data.mower.activity,
-                mower_inactive_reason: data.mower.inactive_reason,
-                mower_state: data.mower.state,
-                work_area_id: data.mower.work_area_id,
-                error_code: data.mower.error_code,
-                error_code_timestamp: data.mower.error_code_timestamp,
-                is_error_confirmable: data.mower.is_error_confirmable,
-                planner_external_reason: data.planner.external_reason,
-                planner_restricted_reason: data.planner.restricted_reason,
-                planner_next_start: data.planner.next_start_timestamp,
-                planner_override: data.planner.r#override.map(|o| o.action),
-                cutting_height: data.settings.as_ref().and_then(|s| s.cutting_height),
-                headlight_mode: data
-                    .settings
-                    .as_ref()
-                    .and_then(|s| s.headlight.as_ref())
-                    .map(|h| h.mode.clone()),
-            })),
+            property_inputs,
+            property_ready,
+            status: initial_state,
         }
     }
 
-    fn prop_description(&self, node_id: &HomieID, prop_id: &HomieID) -> &HomiePropertyDescription {
-        self.description
-            .nodes
-            .get(node_id)
-            .unwrap_or_else(|| panic!("attempting to publish unkonwn automower node `{node_id}`"))
-            .properties
-            .get(prop_id)
-            .unwrap_or_else(|| {
-                panic!("attempting to publish unkonwn automower property `{node_id}/{prop_id}`")
-            })
-    }
-
-    async fn record_event(
-        &self,
-        event: schemas::websocket::Event,
-        publish_targets: bool,
-    ) -> Result<(), Error> {
-        let events = match event {
-            schemas::websocket::Event::BatteryEventV2 { attributes: a, .. } => {
-                let mut data = self.data.lock().await;
-                data.battery_percent = a
-                    .battery
-                    .and_then(|b| b.battery_percent)
-                    .unwrap_or(data.battery_percent);
-                let pct = data.battery_percent.to_string();
-                vec![(&BATTERY_NODE_ID, &BATTERY_LEVEL_PROP_ID, None, pct)]
+    async fn ensure_property_tasks(&self) {
+        let device_id = self.protocol.device_ref().device_id().to_string();
+        let mut property_inputs = self.property_inputs.lock().await;
+        for (node_id, _, prop_id, prop) in self.description.iter() {
+            let key = (device_id.clone(), node_id.to_string(), prop_id.to_string());
+            if property_inputs
+                .get(&key)
+                .is_some_and(|sender| !sender.is_closed())
+            {
+                continue;
             }
-            schemas::websocket::Event::CalendarEventV2 { attributes: _a, .. } => return Ok(()),
-            schemas::websocket::Event::CuttingHeightEventV2 { attributes: a, .. } => {
-                let mut data = self.data.lock().await;
-                data.cutting_height = a
-                    .cutting_height
-                    .and_then(|c| c.height)
-                    .or(data.cutting_height);
-                let Some(ch) = data.cutting_height else {
-                    return Ok(());
-                };
-                let ch = ch.to_string();
-                vec![(
-                    &SETTINGS_NODE_ID,
-                    &SETTINGS_CUTTING_HEIGHT_PROP_ID,
-                    None,
-                    ch,
-                )]
-            }
-            schemas::websocket::Event::HeadlightsEventV2 { attributes: a, .. } => {
-                let mut data = self.data.lock().await;
-                data.headlight_mode = a.headlight.map(|c| c.mode).or(data.headlight_mode.clone());
-                let Some(mode) = data.headlight_mode.clone() else {
-                    return Ok(());
-                };
-                vec![(&SETTINGS_NODE_ID, &SETTINGS_HEADLIGHT_PROP_ID, None, mode)]
-            }
-            schemas::websocket::Event::MessageEventV2 { attributes: _a, .. } => return Ok(()),
-            schemas::websocket::Event::MowerEventV2 { attributes: a, .. } => {
-                let mut evts = vec![];
-                let Some(mower) = a.mower else { return Ok(()) };
-                let mut data = self.data.lock().await;
-                if let Some(mode) = mower.mode {
-                    data.mower_mode = mode.clone();
-                    evts.push((&MOWER_NODE_ID, &MOWER_MODE_PROP_ID, None, mode));
+            let (sender, inputs) = mpsc::unbounded_channel();
+            property_inputs.insert(key, sender);
+            tokio::spawn(
+                PropertyTask {
+                    api: Arc::clone(&self.api),
+                    api_client: Arc::clone(&self.api_client),
+                    external_inhibits: Arc::clone(&self.external_inhibits),
+                    mqtt: self.mqtt.clone(),
+                    protocol: self.protocol.clone(),
+                    node_id: node_id.clone(),
+                    prop_id: prop_id.clone(),
+                    settable: prop.settable,
+                    retained: prop.retained,
+                    inputs,
+                    api_changes: self.api.subscribe(),
+                    ready: self.property_ready.subscribe(),
+                    last_value: None,
+                    last_target: None,
+                    pending_target: None,
                 }
-                if let Some(activity) = mower.activity {
-                    data.mower_activity = activity.clone();
-                    evts.push((&MOWER_NODE_ID, &MOWER_ACTIVITY_PROP_ID, None, activity));
-                }
-                if let Some(reason) = mower.inactive_reason {
-                    data.mower_inactive_reason = Some(reason.clone());
-                    evts.push((&MOWER_NODE_ID, &MOWER_INACTIVE_REASON_PROP_ID, None, reason));
-                }
-                if let Some(state) = mower.state {
-                    data.mower_state = state.clone();
-                    evts.push((&MOWER_NODE_ID, &MOWER_STATE_PROP_ID, None, state));
-                }
-                if let Some(ec) = mower.error_code {
-                    data.error_code = Some(ec);
-                    evts.push((
-                        &MOWER_NODE_ID,
-                        &MOWER_ERROR_CODE_PROP_ID,
-                        None,
-                        ec.to_string(),
-                    ));
-                }
-                if let Some(id) = mower.work_area_id {
-                    data.work_area_id = Some(id);
-                    evts.push((
-                        &MOWER_NODE_ID,
-                        &MOWER_WORK_AREA_ID_PROP_ID,
-                        None,
-                        id.to_string(),
-                    ));
-                }
-                let mowing_value = derive_mowing(&data).to_string();
-                evts.push((
-                    &MOWER_NODE_ID,
-                    &MOWER_MOWING_PROP_ID,
-                    publish_targets.then(|| mowing_value.clone()),
-                    mowing_value,
-                ));
-                let parked_value = derive_parked(&data).to_string();
-                evts.push((
-                    &MOWER_NODE_ID,
-                    &MOWER_PARKED_PROP_ID,
-                    publish_targets.then(|| parked_value.clone()),
-                    parked_value,
-                ));
-                let paused_value = derive_paused(&data).to_string();
-                evts.push((
-                    &MOWER_NODE_ID,
-                    &MOWER_PAUSED_PROP_ID,
-                    publish_targets.then(|| paused_value.clone()),
-                    paused_value,
-                ));
-                evts.push((
-                    &MOWER_NODE_ID,
-                    &MOWER_INACTIVE_PROP_ID,
-                    None,
-                    derive_inactive(&data).to_string(),
-                ));
-
-                evts
-            }
-            schemas::websocket::Event::PlannerEventV2 { attributes: a, .. } => {
-                let mut evts = vec![];
-                let Some(planner) = a.planner else {
-                    return Ok(());
-                };
-                let mut data = self.data.lock().await;
-                if let Some(t) = planner.next_start_timestamp {
-                    data.planner_next_start = t;
-                    let dt = if t == 0 {
-                        jiff::Timestamp::now().to_string()
-                    } else {
-                        mower_datetime(t).to_string()
-                    };
-                    evts.push((&PLANNER_NODE_ID, &PLANNER_NEXT_START_PROP_ID, None, dt));
-                }
-                if let Some(o) = planner.r#override {
-                    data.planner_override = Some(o.action.clone());
-                    evts.push((&PLANNER_NODE_ID, &PLANNER_OVERRIDE_PROP_ID, None, o.action));
-                }
-                if let Some(r) = planner.restricted_reason {
-                    data.planner_restricted_reason = r.clone();
-                    evts.push((
-                        &PLANNER_NODE_ID,
-                        &PLANNER_RESTRICTED_REASON_PROP_ID,
-                        None,
-                        r,
-                    ));
-                }
-                if let Some(r) = planner.external_reason {
-                    data.planner_external_reason = Some(r);
-                    let r = r.to_string();
-                    evts.push((&PLANNER_NODE_ID, &PLANNER_EXTERNAL_REASON_PROP_ID, None, r));
-                }
-                evts
-            }
-            schemas::websocket::Event::PositionEventV2 { attributes: a, .. } => {
-                let mut data = self.data.lock().await;
-                let pos = a.position.as_ref();
-                data.latitude = pos.and_then(|p| p.latitude).or(data.latitude);
-                data.longitude = pos.and_then(|p| p.longitude).or(data.longitude);
-                let (Some(lat), Some(lon)) = (data.latitude, data.longitude) else {
-                    return Ok(());
-                };
-                let latlon = format!("{},{}", lat, lon);
-                vec![(&POSITION_NODE_ID, &POSITION_LATLON_PROP_ID, None, latlon)]
-            }
-        };
-        for (node_id, prop_id, target, value) in events {
-            let prop_desc = self.prop_description(node_id, prop_id);
-            let p = self
-                .protocol
-                .publish_value(node_id, prop_id, &value, prop_desc.retained);
-            self.mqtt
-                .homie_publish(p)
-                .await
-                .map_err(|e| Error::PublishValue(e, node_id, prop_id))?;
-            if let Some(tgt) = target {
-                let p = self
-                    .protocol
-                    .publish_target(node_id, prop_id, tgt, prop_desc.retained);
-                self.mqtt
-                    .homie_publish(p)
-                    .await
-                    .map_err(|e| Error::PublishTarget(e, node_id, prop_id))?;
-            }
+                .run(),
+            );
         }
-        Ok(())
     }
 
-    async fn publish_device(&self) -> Result<(), Error> {
-        let initial_state = self.data.lock().await.homie_status;
+    async fn publish_device(&mut self) -> Result<(), Error> {
+        let initial_state = self.status;
         for step in homie5::homie_device_publish_steps() {
             match step {
                 homie5::DevicePublishStep::DeviceStateInit => {
-                    let p = self.protocol.publish_state(initial_state);
+                    let publish = self.protocol.publish_state(initial_state);
                     self.mqtt
-                        .homie_publish(p)
+                        .homie_publish(publish)
                         .await
                         .map_err(Error::PublishInitState)?;
                 }
                 homie5::DevicePublishStep::DeviceDescription => {
-                    let p = self
+                    let publish = self
                         .protocol
                         .publish_description(&self.description)
                         .map_err(Error::GenerateDescription)?;
                     self.mqtt
-                        .homie_publish(p)
+                        .homie_publish(publish)
                         .await
                         .map_err(Error::PublishDescription)?;
                 }
                 homie5::DevicePublishStep::PropertyValues => {
-                    use schemas::websocket::*;
                     if initial_state == HomieDeviceStatus::Disconnected {
                         continue;
                     }
-                    let evs = {
-                        let data = self.data.lock().await;
-                        [
-                            Event::BatteryEventV2 {
-                                id: self.api_id.clone(),
-                                attributes: Default::default(),
-                            },
-                            Event::PositionEventV2 {
-                                id: self.api_id.clone(),
-                                attributes: Default::default(),
-                            },
-                            Event::MowerEventV2 {
-                                id: self.api_id.clone(),
-                                attributes: MowerAttributes {
-                                    mower: Some(Mower {
-                                        mode: Some(data.mower_mode.clone()),
-                                        activity: Some(data.mower_activity.clone()),
-                                        inactive_reason: data
-                                            .mower_inactive_reason
-                                            .clone()
-                                            .or_else(|| Some("NONE".into())),
-                                        state: Some(data.mower_state.clone()),
-                                        work_area_id: data.work_area_id,
-                                        error_code: data.error_code,
-                                        error_code_timestamp: data.error_code_timestamp,
-                                        is_error_confirmable: data.is_error_confirmable,
-                                    }),
-                                },
-                            },
-                            Event::PlannerEventV2 {
-                                id: self.api_id.clone(),
-                                attributes: PlannerAttributes {
-                                    planner: Some(Planner {
-                                        next_start_timestamp: Some(data.planner_next_start),
-                                        r#override: data.planner_override.clone().map(|o| {
-                                            schemas::automower::PlannerOverride { action: o }
-                                        }),
-                                        restricted_reason: Some(
-                                            data.planner_restricted_reason.clone(),
-                                        ),
-                                        external_reason: data.planner_external_reason,
-                                    }),
-                                },
-                            },
-                            Event::HeadlightsEventV2 {
-                                id: self.api_id.clone(),
-                                attributes: Default::default(),
-                            },
-                            Event::CuttingHeightEventV2 {
-                                id: self.api_id.clone(),
-                                attributes: Default::default(),
-                            },
-                        ]
-                    };
-                    for ev in evs {
-                        self.record_event(ev, true).await?;
-                    }
+                    self.publish_all_properties().await?;
                 }
                 homie5::DevicePublishStep::SubscribeProperties => {
                     if initial_state == HomieDeviceStatus::Disconnected {
                         continue;
                     }
-                    let p = self
+                    let subscriptions = self
                         .protocol
                         .subscribe_props(&self.description)
                         .map_err(Error::GenerateSubscribtions)?;
                     self.mqtt
-                        .homie_subscribe(p)
+                        .homie_subscribe(subscriptions)
                         .await
                         .map_err(Error::Subscribe)?;
                 }
@@ -1345,16 +1362,269 @@ impl MowerContext {
                     if initial_state == HomieDeviceStatus::Disconnected {
                         continue;
                     }
-                    let p = self.protocol.publish_state(HomieDeviceStatus::Ready);
+                    let publish = self.protocol.publish_state(HomieDeviceStatus::Ready);
                     self.mqtt
-                        .homie_publish(p)
+                        .homie_publish(publish)
                         .await
                         .map_err(Error::PublishReadyState)?;
+                    self.status = HomieDeviceStatus::Ready;
+                    self.property_ready.send_replace(true);
                 }
             }
         }
         Ok(())
     }
+
+    async fn publish_device_state(&self, status: HomieDeviceStatus) -> Result<(), Error> {
+        let publish = self.protocol.publish_state(status);
+        self.mqtt
+            .homie_publish(publish)
+            .await
+            .map_err(Error::PublishInitState)
+    }
+
+    async fn clear_work_area_node(&self, id: i64) -> Result<(), Error> {
+        let node_id = work_area_node_id(id);
+        for prop_id in [
+            &WORK_AREA_ID_PROP_ID,
+            &WORK_AREA_NAME_PROP_ID,
+            &WORK_AREA_TYPE_PROP_ID,
+            &WORK_AREA_CUTTING_HEIGHT_PROP_ID,
+            &WORK_AREA_ENABLED_PROP_ID,
+            &WORK_AREA_SCHEDULABLE_PROP_ID,
+            &WORK_AREA_ORIENTATION_PROP_ID,
+            &WORK_AREA_ORIENTATION_SHIFT_PROP_ID,
+            &WORK_AREA_CURRENT_ORIENTATION_PROP_ID,
+            &WORK_AREA_OVERLAP_PROP_ID,
+            &WORK_AREA_PROGRESS_PROP_ID,
+            &WORK_AREA_LAST_TIME_COMPLETED_PROP_ID,
+            &WORK_AREA_LAST_TIME_ABANDONED_PROP_ID,
+            &WORK_AREA_USE_GLOBAL_CUTTING_HEIGHT_PROP_ID,
+            &WORK_AREA_CALENDAR_PROP_ID,
+        ] {
+            self.erase_property(&node_id, prop_id).await?;
+        }
+        Ok(())
+    }
+}
+
+fn homie_property_value(
+    data: &schemas::automower::MowerData,
+    node_id: &str,
+    prop_id: &str,
+    external_inhibits: &[ExternalInhibit],
+) -> Option<String> {
+    if let Some(id) = parse_work_area_node_id(node_id) {
+        if prop_id == "id" {
+            return Some(id.to_string());
+        }
+        let area = data
+            .work_areas
+            .as_ref()?
+            .iter()
+            .find(|area| area.work_area_id == Some(id))?;
+        return match prop_id {
+            "name" => area.name.clone(),
+            "type" => area.r#type.clone(),
+            "cutting-height" => area.cutting_height.map(|value| value.to_string()),
+            "enabled" => area.enabled.map(|value| value.to_string()),
+            "schedulable" => area.schedulable.map(|value| value.to_string()),
+            "orientation" => area.orientation.map(mower_degrees_tenths),
+            "orientation-shift" => area.orientation_shift.map(mower_degrees_tenths),
+            "current-orientation" => area.current_orientation.map(mower_degrees_tenths),
+            "overlap" => area.overlap.map(|value| value.to_string()),
+            "progress" => area.progress.map(|value| value.to_string()),
+            "last-time-completed" => area
+                .last_time_completed
+                .map(|value| mower_datetime_seconds(value).to_string()),
+            "last-time-abandoned" => area
+                .last_time_abandoned
+                .map(|value| mower_datetime_seconds(value).to_string()),
+            "use-global-cutting-height" => area
+                .use_global_cutting_height
+                .map(|value| value.to_string()),
+            "calendar" => area.calendar.as_ref().map(|calendar| {
+                let mut tasks = calendar.tasks.clone();
+                for task in &mut tasks {
+                    task.work_area_id = None;
+                }
+                serde_json::to_string(&tasks).expect("calendar schema is serializable")
+            }),
+            _ => None,
+        };
+    }
+
+    match (node_id, prop_id) {
+        ("battery", "level") => Some(data.battery.battery_percent.to_string()),
+        ("position", "latitude-longitude") => {
+            let position = data.positions.as_ref()?.last()?;
+            Some(format!("{},{}", position.latitude?, position.longitude?))
+        }
+        ("mower", "mode") => Some(data.mower.mode.clone()),
+        ("mower", "activity") => Some(data.mower.activity.clone()),
+        ("mower", "inactive-reason") => Some(
+            data.mower
+                .inactive_reason
+                .clone()
+                .unwrap_or_else(|| "NONE".to_owned()),
+        ),
+        ("mower", "state") => Some(data.mower.state.clone()),
+        ("mower", "error-code") => data.mower.error_code.map(|value| value.to_string()),
+        ("mower", "work-area") => data.mower.work_area_id.map(|value| value.to_string()),
+        ("mower", "mowing") => Some(derive_mowing_api(data).to_owned()),
+        ("mower", "parked") => Some(derive_parked_api(data).to_owned()),
+        ("mower", "paused") => Some((data.mower.state == "PAUSED").to_string()),
+        ("mower", "inactive") => Some(derive_inactive_api(data).to_owned()),
+        ("planner", "next-start") => Some(if data.planner.next_start_timestamp == 0 {
+            jiff::Timestamp::now().to_string()
+        } else {
+            mower_datetime(data.planner.next_start_timestamp).to_string()
+        }),
+        ("planner", "override-action") => data
+            .planner
+            .r#override
+            .as_ref()
+            .map(|value| value.action.clone()),
+        ("planner", "restricted-reason") => Some(data.planner.restricted_reason.clone()),
+        ("planner", "external-reason") => {
+            data.planner.external_reason.map(|value| value.to_string())
+        }
+        ("planner", prop_id) if prop_id.starts_with("external-inhibit-") => {
+            let inhibit = external_inhibits
+                .iter()
+                .find(|inhibit| inhibit.name.as_str() == prop_id)?;
+            Some(
+                (data.planner.external_reason == Some(inhibit.reason))
+                    .then_some("enable")
+                    .unwrap_or("disable")
+                    .to_owned(),
+            )
+        }
+        ("settings", "cutting-height") => data
+            .settings
+            .as_ref()?
+            .cutting_height
+            .map(|value| value.to_string()),
+        ("settings", "headlight-mode") => data
+            .settings
+            .as_ref()?
+            .headlight
+            .as_ref()
+            .map(|value| value.mode.clone()),
+        _ => None,
+    }
+}
+
+fn derive_mowing_api(data: &schemas::automower::MowerData) -> &'static str {
+    match data.mower.activity.as_str() {
+        "GOING_HOME" | "LEAVING" => "commuting",
+        "MOWING"
+            if data
+                .planner
+                .r#override
+                .as_ref()
+                .map(|value| value.action.as_str())
+                == Some("FORCE_MOW") =>
+        {
+            if data.mower.work_area_id.unwrap_or(0) == 0 {
+                "forced-for-duration"
+            } else {
+                "forced-in-workarea"
+            }
+        }
+        "MOWING" => "yes",
+        _ => "no",
+    }
+}
+
+fn derive_parked_api(data: &schemas::automower::MowerData) -> &'static str {
+    if matches!(data.mower.activity.as_str(), "CHARGING" | "PARKED_IN_CS") {
+        if data
+            .planner
+            .r#override
+            .as_ref()
+            .map(|value| value.action.as_str())
+            == Some("FORCE_PARK")
+        {
+            "for-duration"
+        } else {
+            "yes"
+        }
+    } else {
+        "no"
+    }
+}
+
+fn derive_inactive_api(data: &schemas::automower::MowerData) -> &'static str {
+    match data.mower.inactive_reason.as_deref() {
+        Some("PLANNING") => "planning",
+        Some("SEARCHING_FOR_SATELLITES") => "searching-for-satellites",
+        _ => "no",
+    }
+}
+
+fn work_area_node_id(id: i64) -> HomieID {
+    HomieID::try_from(format!("work-area-{id}")).expect("work area IDs are valid Homie IDs")
+}
+
+fn parse_work_area_node_id(node_id: &str) -> Option<i64> {
+    node_id
+        .strip_prefix("work-area-")?
+        .parse::<i64>()
+        .ok()
+        .filter(|id| *id >= 0)
+}
+
+fn work_area_node_description() -> homie5::device_description::HomieNodeDescription {
+    let integer = PropertyDescriptionBuilder::integer().build();
+    let percentage = PropertyDescriptionBuilder::integer()
+        .unit(HOMIE_UNIT_PERCENT)
+        .range(0..=100)
+        .settable(true)
+        .build();
+    let boolean = PropertyDescriptionBuilder::boolean().build();
+    let settable_boolean = PropertyDescriptionBuilder::boolean().settable(true).build();
+    let string = PropertyDescriptionBuilder::string().settable(true).build();
+    let orientation = PropertyDescriptionBuilder::float()
+        .unit(HOMIE_UNIT_DEGREE)
+        .range(0.0..=180.0)
+        .settable(true)
+        .build();
+    let current_orientation = PropertyDescriptionBuilder::float()
+        .unit(HOMIE_UNIT_DEGREE)
+        .range(0.0..=180.0)
+        .build();
+    let work_area_type =
+        PropertyDescriptionBuilder::enumeration(["BOUNDARY", "RANDOM", "SYSTEMATIC"])
+            .expect("work area type enum is valid")
+            .build();
+    let json = PropertyDescriptionBuilder::json().settable(true).build();
+    NodeDescriptionBuilder::new()
+        .add_property(WORK_AREA_ID_PROP_ID.clone(), integer.clone())
+        .add_property(WORK_AREA_NAME_PROP_ID.clone(), string.clone())
+        .add_property(WORK_AREA_TYPE_PROP_ID.clone(), work_area_type)
+        .add_property(WORK_AREA_CUTTING_HEIGHT_PROP_ID.clone(), percentage.clone())
+        .add_property(WORK_AREA_ENABLED_PROP_ID.clone(), settable_boolean)
+        .add_property(WORK_AREA_SCHEDULABLE_PROP_ID.clone(), boolean.clone())
+        .add_property(WORK_AREA_ORIENTATION_PROP_ID.clone(), orientation.clone())
+        .add_property(WORK_AREA_ORIENTATION_SHIFT_PROP_ID.clone(), orientation)
+        .add_property(
+            WORK_AREA_CURRENT_ORIENTATION_PROP_ID.clone(),
+            current_orientation,
+        )
+        .add_property(WORK_AREA_OVERLAP_PROP_ID.clone(), integer.clone())
+        .add_property(WORK_AREA_PROGRESS_PROP_ID.clone(), percentage)
+        .add_property(
+            WORK_AREA_LAST_TIME_COMPLETED_PROP_ID.clone(),
+            PropertyDescriptionBuilder::datetime().build(),
+        )
+        .add_property(
+            WORK_AREA_LAST_TIME_ABANDONED_PROP_ID.clone(),
+            PropertyDescriptionBuilder::datetime().build(),
+        )
+        .add_property(WORK_AREA_USE_GLOBAL_CUTTING_HEIGHT_PROP_ID.clone(), boolean)
+        .add_property(WORK_AREA_CALENDAR_PROP_ID.clone(), json)
+        .build()
 }
 
 trait MqttClientExt {
@@ -1406,41 +1676,13 @@ fn mower_datetime(since_mower_epoch: u64) -> jiff::civil::DateTime {
         .expect("adding milliseconds to epoch should never overflow?")
 }
 
-fn derive_mowing(data: &MowerState) -> &'static str {
-    match &*data.mower_state {
-        "GOING_HOME" | "LEAVING" => "commuting",
-        "MOWING" if data.planner_override.as_deref() == Some("FORCE_MOW") => {
-            if data.work_area_id.unwrap_or(0) == 0 {
-                "forced-for-duration"
-            } else {
-                "forced-in-workarea"
-            }
-        }
-        "MOWING" => "yes",
-        _ => "no",
-    }
+fn mower_datetime_seconds(since_mower_epoch: i64) -> jiff::civil::DateTime {
+    const EPOCH: jiff::civil::DateTime = jiff::civil::DateTime::constant(1970, 1, 1, 0, 0, 0, 0);
+    EPOCH
+        .checked_add(jiff::Span::new().seconds(since_mower_epoch))
+        .expect("adding seconds to epoch should never overflow")
 }
 
-fn derive_parked(data: &MowerState) -> &'static str {
-    if let "CHARGING" | "PARKED_IN_CS" = &*data.mower_activity {
-        if data.planner_override.as_deref() == Some("FORCE_PARK") {
-            "for-duration"
-        } else {
-            "yes"
-        }
-    } else {
-        "no"
-    }
-}
-
-fn derive_paused(data: &MowerState) -> bool {
-    data.mower_state == "PAUSED"
-}
-
-fn derive_inactive(data: &MowerState) -> &'static str {
-    match data.mower_inactive_reason.as_deref() {
-        Some("PLANNING") => "planning",
-        Some("SEARCHING_FOR_SATELLITES") => "searching-for-satellites",
-        _ => "no",
-    }
+fn mower_degrees_tenths(value: u16) -> String {
+    format!("{:.1}", f64::from(value) / 10.0)
 }
