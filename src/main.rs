@@ -4,6 +4,7 @@ use homie5::client::Publish as HomiePublish;
 use homie5::client::Subscription;
 use homie5::device_description::DeviceDescriptionBuilder;
 use homie5::device_description::HomieDeviceDescription;
+use homie5::device_description::HomieNodeDescription;
 use homie5::device_description::NodeDescriptionBuilder;
 use homie5::device_description::PropertyDescriptionBuilder;
 use homie5::{HOMIE_UNIT_DEGREE, HOMIE_UNIT_PERCENT};
@@ -11,7 +12,7 @@ use homie5::{Homie5DeviceProtocol, HomieDeviceStatus, HomieID};
 use rumqttc::v5::MqttOptions;
 use rumqttc::v5::mqttbytes::v5::LastWill;
 use rumqttc::v5::mqttbytes::v5::Publish;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
@@ -60,6 +61,10 @@ static WORK_AREA_LAST_TIME_ABANDONED_PROP_ID: HomieID = HomieID::new_const("last
 static WORK_AREA_USE_GLOBAL_CUTTING_HEIGHT_PROP_ID: HomieID =
     HomieID::new_const("use-global-cutting-height");
 static WORK_AREA_CALENDAR_PROP_ID: HomieID = HomieID::new_const("calendar");
+static STAY_OUT_ZONE_ID_PROP_ID: HomieID = HomieID::new_const("id");
+static STAY_OUT_ZONE_NAME_PROP_ID: HomieID = HomieID::new_const("name");
+static STAY_OUT_ZONE_ENABLED_PROP_ID: HomieID = HomieID::new_const("enabled");
+static STAY_OUT_ZONE_DIRTY_PROP_ID: HomieID = HomieID::new_const("dirty");
 
 const USER_AGENT: &str = concat!(
     env!("CARGO_PKG_NAME"),
@@ -304,7 +309,7 @@ struct PendingTarget {
     expected: String,
     deadline: tokio::time::Instant,
     /// Has the API poll for the change for as long as the target is pending.
-    _wait: Option<api::WorkAreaWait>,
+    _wait: Option<api::ChangeWait>,
 }
 
 struct Context {
@@ -553,10 +558,6 @@ impl PropertyTask {
 
     /// Forward the command to the API and start waiting for the API to report the new value.
     async fn set(&mut self, value: &str) -> Result<(), Error> {
-        if !self.settable {
-            tracing::error!(node_id = %self.node_id, prop_id = %self.prop_id, "property not settable");
-            return Ok(());
-        }
         let Some(command) = parse_set(
             &self.external_inhibits,
             self.node_id.as_str(),
@@ -597,8 +598,9 @@ impl PropertyTask {
             }
             return Err(error);
         }
-        // Work areas are not covered by the websocket, so have the API poll for the change.
-        let wait = parse_work_area_node_id(self.node_id.as_str()).map(|_| {
+        // Work areas and stay-out zones are not covered by the websocket, so have the API poll
+        // for the change.
+        let wait = is_polled_node(self.node_id.as_str()).then(|| {
             let (node_id, prop_id) = (self.node_id.clone(), self.prop_id.clone());
             let external_inhibits = Arc::clone(&self.external_inhibits);
             let expected = Some(command.expected);
@@ -742,9 +744,10 @@ enum SetRequest {
         path: String,
         body: serde_json::Value,
     },
-    PatchWorkArea {
-        work_area_id: i64,
-        attributes: serde_json::Value,
+    /// `PATCH /mowers/{id}/{path}`
+    Patch {
+        path: String,
+        body: serde_json::Value,
     },
 }
 
@@ -752,14 +755,7 @@ impl SetRequest {
     async fn send(self, api_client: &api::Client, mower_id: &str) -> Result<(), api::Error> {
         match self {
             SetRequest::Post { path, body } => api_client.post_mower(mower_id, &path, body).await,
-            SetRequest::PatchWorkArea {
-                work_area_id,
-                attributes,
-            } => {
-                api_client
-                    .patch_work_area(mower_id, work_area_id, attributes)
-                    .await
-            }
+            SetRequest::Patch { path, body } => api_client.patch_mower(mower_id, &path, body).await,
         }
     }
 }
@@ -856,16 +852,37 @@ fn parse_set(
                     mower_degrees_tenths(tenths),
                 )
             }
-            _ => {
-                tracing::error!(%node_id, %prop_id, "work area property not settable");
-                return None;
-            }
+            _ => unreachable!("only the settable work area properties are subscribed to"),
         };
         return Some(SetCommand {
             expected,
-            request: SetRequest::PatchWorkArea {
-                work_area_id,
-                attributes,
+            request: SetRequest::Patch {
+                path: format!("workAreas/{work_area_id}"),
+                body: serde_json::json!({ "data": {
+                    "id": work_area_id,
+                    "type": "workArea",
+                    "attributes": attributes
+                }}),
+            },
+        });
+    }
+    if let Some(zone_id) = parse_stay_out_zone_node_id(node_id) {
+        if prop_id != "enabled" {
+            unreachable!("only the settable stay-out zone properties are subscribed to");
+        }
+        let Ok(enable) = val.parse::<bool>() else {
+            tracing::error!(%node_id, %val, "stay-out zone enabled value is not a boolean");
+            return None;
+        };
+        return Some(SetCommand {
+            expected: enable.to_string(),
+            request: SetRequest::Patch {
+                path: format!("stayOutZones/{zone_id}"),
+                body: serde_json::json!({ "data": {
+                    "id": zone_id,
+                    "type": "stayOutZone",
+                    "attributes": { "enable": enable }
+                }}),
             },
         });
     }
@@ -909,13 +926,10 @@ fn parse_set(
             ("actions", body, val.to_owned())
         }
         ("planner", prop_id) => {
-            let Some(inhibit) = external_inhibits
+            let inhibit = external_inhibits
                 .iter()
                 .find(|inhibit| inhibit.name.as_str() == prop_id)
-            else {
-                tracing::error!(%node_id, %prop_id, "unknown external inhibit");
-                return None;
-            };
+                .expect("only the configured external inhibits are subscribed to");
             let duration = match val {
                 "enable" => inhibit.duration_minutes,
                 "disable" => 1,
@@ -933,10 +947,7 @@ fn parse_set(
             }});
             ("actions", body, val.to_owned())
         }
-        _ => {
-            tracing::error!(%node_id, %prop_id, "property not settable");
-            return None;
-        }
+        _ => unreachable!("only the settable properties are subscribed to"),
     };
     Some(SetCommand {
         expected,
@@ -961,13 +972,7 @@ impl MowerContext {
 
     async fn synchronize_from_api(&mut self) -> Result<(), Error> {
         let data = self.api.snapshot().await;
-        let work_area_ids = data
-            .work_areas
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|area| area.work_area_id)
-            .collect();
-        self.update_work_areas(work_area_ids).await
+        self.update_dynamic_nodes(dynamic_nodes(&data)).await
     }
 
     async fn send_property_message(
@@ -1018,42 +1023,42 @@ impl MowerContext {
         Ok(())
     }
 
-    /// Make the set of `work-area-*` nodes match `work_area_ids`.
+    /// Make the set of the nodes for work areas and stay-out zones match `wanted`.
     ///
     /// Per the Homie convention, a change to the description requires the device to go through
     /// `init` before it becomes `ready` again, so the description gets republished from scratch.
-    async fn update_work_areas(&mut self, work_area_ids: BTreeSet<i64>) -> Result<(), Error> {
-        let old_ids = self
+    async fn update_dynamic_nodes(
+        &mut self,
+        wanted: BTreeMap<HomieID, HomieNodeDescription>,
+    ) -> Result<(), Error> {
+        let old_nodes = self
             .description
             .nodes
-            .keys()
-            .filter_map(|id| parse_work_area_node_id(id.as_str()))
-            .collect::<BTreeSet<_>>();
-        if old_ids == work_area_ids {
+            .iter()
+            .filter(|(id, _)| is_polled_node(id.as_str()))
+            .collect::<BTreeMap<_, _>>();
+        if old_nodes.keys().copied().eq(wanted.keys()) {
             return Ok(());
         }
+        let removed = old_nodes
+            .iter()
+            .filter(|(id, _)| !wanted.contains_key(**id))
+            .map(|(id, node)| ((*id).clone(), node.properties.keys().cloned().collect()))
+            .collect::<Vec<(HomieID, Vec<HomieID>)>>();
         let old_description = self.description.clone();
         let mut description = old_description.clone();
         description
             .nodes
-            .retain(|id, _| parse_work_area_node_id(id.as_str()).is_none());
-        for id in &work_area_ids {
-            description
-                .nodes
-                .insert(work_area_node_id(*id), work_area_node_description());
-        }
+            .retain(|id, _| !is_polled_node(id.as_str()));
+        description.nodes.extend(wanted);
         description.update_version();
-        let removed_ids = old_ids
-            .difference(&work_area_ids)
-            .copied()
-            .collect::<Vec<_>>();
         let old_status = self.status;
         if old_status == HomieDeviceStatus::Ready {
             self.status = HomieDeviceStatus::Init;
             self.property_ready.send_replace(false);
         }
         self.description = description;
-        let result = self.republish(removed_ids).await;
+        let result = self.republish(removed).await;
         if result.is_err() {
             self.description = old_description;
             self.status = old_status;
@@ -1063,10 +1068,12 @@ impl MowerContext {
         result
     }
 
-    async fn republish(&mut self, removed_ids: Vec<i64>) -> Result<(), Error> {
+    async fn republish(&mut self, removed: Vec<(HomieID, Vec<HomieID>)>) -> Result<(), Error> {
         self.publish_device_state(self.status).await?;
-        for id in removed_ids {
-            self.clear_work_area_node(id).await?;
+        for (node_id, prop_ids) in removed {
+            for prop_id in prop_ids {
+                self.erase_property(&node_id, &prop_id).await?;
+            }
         }
         self.ensure_property_tasks().await;
         self.publish_device().await
@@ -1096,12 +1103,7 @@ impl MowerContext {
         } else {
             HomieDeviceStatus::Disconnected
         };
-        let work_area_ids = data
-            .work_areas
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|area| area.work_area_id)
-            .collect::<BTreeSet<_>>();
+        let dynamic_nodes = dynamic_nodes(&data);
         let mut description = DeviceDescriptionBuilder::new()
             .name(data.system.name.clone())
             .root(root_id.clone())
@@ -1262,9 +1264,8 @@ impl MowerContext {
             .build();
         description = description.add_node(BATTERY_NODE_ID.clone(), battery_node);
         description = description.add_node(POSITION_NODE_ID.clone(), position_node);
-        for id in &work_area_ids {
-            description =
-                description.add_node(work_area_node_id(*id), work_area_node_description());
+        for (id, node) in dynamic_nodes {
+            description = description.add_node(id, node);
         }
         description = description.add_node(MOWER_NODE_ID.clone(), mower_node);
         description = description.add_node(PLANNER_NODE_ID.clone(), planner_node);
@@ -1383,30 +1384,6 @@ impl MowerContext {
             .await
             .map_err(Error::PublishInitState)
     }
-
-    async fn clear_work_area_node(&self, id: i64) -> Result<(), Error> {
-        let node_id = work_area_node_id(id);
-        for prop_id in [
-            &WORK_AREA_ID_PROP_ID,
-            &WORK_AREA_NAME_PROP_ID,
-            &WORK_AREA_TYPE_PROP_ID,
-            &WORK_AREA_CUTTING_HEIGHT_PROP_ID,
-            &WORK_AREA_ENABLED_PROP_ID,
-            &WORK_AREA_SCHEDULABLE_PROP_ID,
-            &WORK_AREA_ORIENTATION_PROP_ID,
-            &WORK_AREA_ORIENTATION_SHIFT_PROP_ID,
-            &WORK_AREA_CURRENT_ORIENTATION_PROP_ID,
-            &WORK_AREA_OVERLAP_PROP_ID,
-            &WORK_AREA_PROGRESS_PROP_ID,
-            &WORK_AREA_LAST_TIME_COMPLETED_PROP_ID,
-            &WORK_AREA_LAST_TIME_ABANDONED_PROP_ID,
-            &WORK_AREA_USE_GLOBAL_CUTTING_HEIGHT_PROP_ID,
-            &WORK_AREA_CALENDAR_PROP_ID,
-        ] {
-            self.erase_property(&node_id, prop_id).await?;
-        }
-        Ok(())
-    }
 }
 
 fn homie_property_value(
@@ -1415,6 +1392,19 @@ fn homie_property_value(
     prop_id: &str,
     external_inhibits: &[ExternalInhibit],
 ) -> Option<String> {
+    if let Some(zone_id) = parse_stay_out_zone_node_id(node_id) {
+        let zones = data.stay_out_zones.as_ref()?;
+        let zone = zones.zones.as_ref()?.iter().find(|zone| {
+            zone.id.as_ref().map(|id| id.to_lowercase()).as_deref() == Some(zone_id)
+        })?;
+        return match prop_id {
+            "id" => Some(zone_id.to_owned()),
+            "name" => zone.name.clone(),
+            "enabled" => zone.enabled.map(|value| value.to_string()),
+            "dirty" => zones.dirty.map(|value| value.to_string()),
+            _ => None,
+        };
+    }
     if let Some(id) = parse_work_area_node_id(node_id) {
         if prop_id == "id" {
             return Some(id.to_string());
@@ -1575,7 +1565,71 @@ fn parse_work_area_node_id(node_id: &str) -> Option<i64> {
         .filter(|id| *id >= 0)
 }
 
-fn work_area_node_description() -> homie5::device_description::HomieNodeDescription {
+const STAY_OUT_ZONE_NODE_PREFIX: &str = "stay-out-zone-";
+
+fn stay_out_zone_node_id(zone_id: &str) -> Option<HomieID> {
+    let node_id = format!("{STAY_OUT_ZONE_NODE_PREFIX}{}", zone_id.to_lowercase());
+    parse_stay_out_zone_node_id(&node_id)?;
+    HomieID::try_from(node_id).ok()
+}
+
+/// The (lowercase) ID of the stay-out zone that the node is for.
+fn parse_stay_out_zone_node_id(node_id: &str) -> Option<&str> {
+    let zone_id = node_id.strip_prefix(STAY_OUT_ZONE_NODE_PREFIX)?;
+    let is_uuid = zone_id.len() == 36
+        && zone_id
+            .chars()
+            .all(|c| c == '-' || c.is_ascii_digit() || ('a'..='f').contains(&c));
+    is_uuid.then_some(zone_id)
+}
+
+/// Whether the node is for something that the API has to be polled for: a work area or a
+/// stay-out zone.
+fn is_polled_node(node_id: &str) -> bool {
+    parse_work_area_node_id(node_id).is_some() || parse_stay_out_zone_node_id(node_id).is_some()
+}
+
+/// The nodes that come and go with the work areas and the stay-out zones of the mower.
+fn dynamic_nodes(data: &schemas::automower::MowerData) -> BTreeMap<HomieID, HomieNodeDescription> {
+    let work_areas = data
+        .work_areas
+        .iter()
+        .flatten()
+        .filter_map(|area| area.work_area_id)
+        .map(|id| (work_area_node_id(id), work_area_node_description()));
+    let stay_out_zones = data
+        .stay_out_zones
+        .iter()
+        .filter_map(|zones| zones.zones.as_ref())
+        .flatten()
+        .filter_map(|zone| stay_out_zone_node_id(zone.id.as_deref()?))
+        .map(|id| (id, stay_out_zone_node_description()));
+    work_areas.chain(stay_out_zones).collect()
+}
+
+fn stay_out_zone_node_description() -> HomieNodeDescription {
+    NodeDescriptionBuilder::new()
+        .add_property(
+            STAY_OUT_ZONE_ID_PROP_ID.clone(),
+            PropertyDescriptionBuilder::string().build(),
+        )
+        .add_property(
+            STAY_OUT_ZONE_NAME_PROP_ID.clone(),
+            PropertyDescriptionBuilder::string().build(),
+        )
+        .add_property(
+            STAY_OUT_ZONE_ENABLED_PROP_ID.clone(),
+            PropertyDescriptionBuilder::boolean().settable(true).build(),
+        )
+        // While the zones are not synchronized with the cloud, they cannot be enabled or disabled.
+        .add_property(
+            STAY_OUT_ZONE_DIRTY_PROP_ID.clone(),
+            PropertyDescriptionBuilder::boolean().build(),
+        )
+        .build()
+}
+
+fn work_area_node_description() -> HomieNodeDescription {
     let integer = PropertyDescriptionBuilder::integer().build();
     let percentage = PropertyDescriptionBuilder::integer()
         .unit(HOMIE_UNIT_PERCENT)

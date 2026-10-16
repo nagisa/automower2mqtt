@@ -11,11 +11,11 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 const API_BASE: &str = "https://api.amc.husqvarna.dev/v1";
 const TOKEN_URL: &str = "https://api.authentication.husqvarnagroup.dev/v1/oauth2/token";
 const TOKEN_EXPIRATION_HEADROOM: Duration = Duration::from_secs(30);
-const WORK_AREAS_POLL_INTERVAL: Duration = Duration::from_secs(15 * 60);
-const WORK_AREA_REFRESH_TIMEOUT: Duration = Duration::from_secs(30);
-/// Delays between the successive reads of the work areas while somebody is waiting for a change
+const POLL_INTERVAL: Duration = Duration::from_secs(15 * 60);
+const REFRESH_TIMEOUT: Duration = Duration::from_secs(30);
+/// Delays between the successive reads of the work areas and stay-out zones while somebody is waiting for a change
 /// to show up. Once these run out, the regular poll interval applies again.
-const WORK_AREA_WAIT_POLL_DELAYS: [Duration; 5] = [
+const WAIT_POLL_DELAYS: [Duration; 5] = [
     Duration::from_secs(2),
     Duration::from_secs(3),
     Duration::from_secs(5),
@@ -90,7 +90,7 @@ impl Client {
         self.initialized.send_replace(true);
         for mower in mowers {
             let client = Arc::clone(&self);
-            tokio::spawn(async move { client.refresh_work_areas_loop(mower).await });
+            tokio::spawn(async move { client.refresh_loop(mower).await });
         }
         self.monitor_websocket().await
     }
@@ -104,8 +104,8 @@ impl Client {
                 continue;
             }
             let mower = Arc::new(Mower::new(datum.id, datum.attributes));
-            if let Err(error) = self.refresh_work_areas(&mower).await {
-                tracing::warn!(%error, mower_id=%mower.id(), "could not load work areas; keeping summary data");
+            if let Err(error) = self.refresh(&mower).await {
+                tracing::warn!(%error, mower_id=%mower.id(), "could not load work areas and stay-out zones; keeping what the summary has");
             }
             self.mowers
                 .lock()
@@ -172,7 +172,7 @@ impl Client {
                         let mower = self.mowers.lock().await.get(id).cloned();
                         if let Some(mower) = mower {
                             if mower.apply_event(&event).await {
-                                mower.request_work_area_refresh();
+                                mower.request_refresh();
                             }
                         } else {
                             tracing::warn!(%id, "received event for an unknown mower");
@@ -186,12 +186,13 @@ impl Client {
         }
     }
 
-    /// Keeps the work areas up to date, as they are not covered by the websocket.
+    /// Keeps the work areas and the stay-out zones up to date, as they are not covered by the
+    /// websocket.
     ///
     /// Reads them periodically, whenever the mower asks for it, and at a quicker pace for as long
     /// as somebody is waiting for a change to show up (see `Mower::wait_for`). Every read
     /// postpones the next periodic one.
-    async fn refresh_work_areas_loop(self: Arc<Self>, mower: Arc<Mower>) {
+    async fn refresh_loop(self: Arc<Self>, mower: Arc<Mower>) {
         use tokio::time::Instant;
         let mut periodic = Instant::now();
         let mut quick: Option<Instant> = None;
@@ -203,7 +204,7 @@ impl Client {
                 _ = mower.refresh_requested.notified() => {}
                 _ = mower.waiters_changed.notified() => {
                     if mower.has_waiters() {
-                        let soonest = Instant::now() + WORK_AREA_WAIT_POLL_DELAYS[0];
+                        let soonest = Instant::now() + WAIT_POLL_DELAYS[0];
                         quick = Some(quick.map_or(soonest, |quick| quick.min(soonest)));
                         quick_attempt = 0;
                     } else {
@@ -212,19 +213,19 @@ impl Client {
                     continue;
                 }
             }
-            let result =
-                tokio::time::timeout(WORK_AREA_REFRESH_TIMEOUT, self.refresh_work_areas(&mower))
-                    .await;
+            let result = tokio::time::timeout(REFRESH_TIMEOUT, self.refresh(&mower)).await;
             match result {
                 Ok(Ok(_)) => {}
                 Ok(Err(error)) => {
-                    tracing::warn!(%error, mower_id=%mower.id(), "could not refresh work areas")
+                    tracing::warn!(%error, mower_id=%mower.id(), "could not refresh work areas and stay-out zones")
                 }
-                Err(_) => tracing::warn!(mower_id=%mower.id(), "work area refresh timed out"),
+                Err(_) => {
+                    tracing::warn!(mower_id=%mower.id(), "work area and stay-out zone refresh timed out")
+                }
             }
-            periodic = Instant::now() + WORK_AREAS_POLL_INTERVAL;
+            periodic = Instant::now() + POLL_INTERVAL;
             mower.notify_waiters().await;
-            quick = match WORK_AREA_WAIT_POLL_DELAYS.get(quick_attempt) {
+            quick = match WAIT_POLL_DELAYS.get(quick_attempt) {
                 Some(delay) if mower.has_waiters() => {
                     quick_attempt += 1;
                     Some(Instant::now() + *delay)
@@ -248,20 +249,16 @@ impl Client {
         .await
     }
 
-    pub(crate) async fn patch_work_area(
+    pub(crate) async fn patch_mower(
         &self,
         mower_id: &str,
-        work_area_id: i64,
-        attributes: serde_json::Value,
+        path: &str,
+        body: serde_json::Value,
     ) -> Result<(), Error> {
         self.write(
             reqwest::Method::PATCH,
-            &format!("/mowers/{mower_id}/workAreas/{work_area_id}"),
-            serde_json::json!({ "data": {
-                "id": work_area_id,
-                "type": "workArea",
-                "attributes": attributes
-            }}),
+            &format!("/mowers/{mower_id}/{path}"),
+            body,
         )
         .await
     }
@@ -369,11 +366,17 @@ impl Client {
         Ok(())
     }
 
+    /// Read everything about the mower that is not kept up to date by the websocket.
+    async fn refresh(&self, mower: &Mower) -> Result<(), Error> {
+        let (work_areas, stay_out_zones) = futures::join!(
+            self.refresh_work_areas(mower),
+            self.refresh_stay_out_zones(mower)
+        );
+        work_areas.and(stay_out_zones)
+    }
+
     /// Read all work areas of the mower with a single request and store them.
-    pub(crate) async fn refresh_work_areas(
-        &self,
-        mower: &Mower,
-    ) -> Result<std::collections::BTreeMap<i64, schemas::automower::WorkArea>, Error> {
+    async fn refresh_work_areas(&self, mower: &Mower) -> Result<(), Error> {
         let uri = format!("/mowers/{}/workAreas", mower.id());
         let document = self
             .get::<schemas::automower::JsonApiDataListDocumentWorkAreas>(&uri)
@@ -383,13 +386,23 @@ impl Client {
             .into_iter()
             .map(|mut area| {
                 area.attributes.work_area_id = Some(area.id);
-                (area.id, area.attributes)
+                area.attributes
             })
-            .collect::<std::collections::BTreeMap<_, _>>();
+            .collect();
+        mower.replace_work_areas(work_areas).await;
+        Ok(())
+    }
+
+    /// Read all stay-out zones of the mower with a single request and store them.
+    async fn refresh_stay_out_zones(&self, mower: &Mower) -> Result<(), Error> {
+        let uri = format!("/mowers/{}/stayOutZones", mower.id());
+        let document = self
+            .get::<schemas::automower::JsonApiDataDocumentStayOutZones>(&uri)
+            .await?;
         mower
-            .replace_work_areas(work_areas.values().cloned().collect())
+            .replace_stay_out_zones(document.data.map(|data| data.attributes))
             .await;
-        Ok(work_areas)
+        Ok(())
     }
 }
 
@@ -406,12 +419,12 @@ pub(crate) struct Mower {
 }
 
 /// Returned by `Mower::wait_for`. The waiting is over when this is dropped.
-pub(crate) struct WorkAreaWait {
+pub(crate) struct ChangeWait {
     mower: Arc<Mower>,
     id: u64,
 }
 
-impl Drop for WorkAreaWait {
+impl Drop for ChangeWait {
     fn drop(&mut self) {
         self.mower.waiters.lock().unwrap().remove(&self.id);
         self.mower.waiters_changed.notify_one();
@@ -432,12 +445,12 @@ impl Mower {
         }
     }
 
-    /// Have the work areas read now.
-    pub(crate) fn request_work_area_refresh(&self) {
+    /// Have the work areas and stay-out zones read now.
+    pub(crate) fn request_refresh(&self) {
         self.refresh_requested.notify_one();
     }
 
-    /// Have the work areas read at a quicker pace until `done` is satisfied with the mower data
+    /// Have the work areas and stay-out zones read at a quicker pace until `done` is satisfied with the mower data
     /// or the returned handle is dropped, whichever comes first.
     ///
     /// Writes to the mower take a while to be reflected by the API. The caller knows what it is
@@ -445,13 +458,13 @@ impl Mower {
     pub(crate) fn wait_for(
         self: &Arc<Self>,
         done: impl Fn(&schemas::automower::MowerData) -> bool + Send + 'static,
-    ) -> WorkAreaWait {
+    ) -> ChangeWait {
         let id = self
             .next_waiter
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.waiters.lock().unwrap().insert(id, Box::new(done));
         self.waiters_changed.notify_one();
-        WorkAreaWait {
+        ChangeWait {
             mower: Arc::clone(self),
             id,
         }
@@ -481,6 +494,23 @@ impl Mower {
 
     fn notify_changed(&self) {
         self.changed.send_modify(|revision| *revision += 1);
+    }
+
+    pub(crate) async fn replace_stay_out_zones(
+        &self,
+        stay_out_zones: Option<schemas::automower::StayOutZones>,
+    ) {
+        let changed = {
+            let mut data = self.data.lock().await;
+            let differs = data.stay_out_zones != stay_out_zones;
+            if differs {
+                data.stay_out_zones = stay_out_zones;
+            }
+            differs
+        };
+        if changed {
+            self.notify_changed();
+        }
     }
 
     pub(crate) async fn replace_work_areas(&self, work_areas: Vec<schemas::automower::WorkArea>) {

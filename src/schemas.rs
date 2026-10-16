@@ -270,14 +270,24 @@ pub(crate) mod automower {
         pub(crate) up_time: Option<u64>,
     }
 
-    #[derive(Debug, Clone, serde::Deserialize)]
+    #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
     #[serde(rename_all = "camelCase")]
     pub(crate) struct StayOutZones {
         pub(crate) dirty: Option<bool>,
         pub(crate) zones: Option<Vec<StayOutZone>>,
     }
 
-    #[derive(Debug, Clone, serde::Deserialize)]
+    #[derive(Debug, serde::Deserialize)]
+    pub(crate) struct JsonApiDataDocumentStayOutZones {
+        pub(crate) data: Option<JsonApiDataStayOutZones>,
+    }
+
+    #[derive(Debug, serde::Deserialize)]
+    pub(crate) struct JsonApiDataStayOutZones {
+        pub(crate) attributes: StayOutZones,
+    }
+
+    #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
     #[serde(rename_all = "camelCase")]
     pub(crate) struct StayOutZone {
         pub(crate) id: Option<String>,
