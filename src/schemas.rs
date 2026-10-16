@@ -12,6 +12,11 @@ pub(crate) mod automower {
     use serde::Deserialize;
 
     #[derive(Debug, serde::Deserialize)]
+    pub(crate) struct JsonApiDataDocument {
+        pub(crate) data: JsonApiData,
+    }
+
+    #[derive(Debug, serde::Deserialize)]
     pub(crate) struct JsonApiDataListDocument {
         pub(crate) data: Vec<JsonApiData>,
     }
@@ -255,7 +260,7 @@ pub(crate) mod automower {
         pub(crate) longitude: Option<f64>,
     }
 
-    #[derive(Debug, Clone, serde::Deserialize)]
+    #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
     #[serde(rename_all = "camelCase")]
     pub(crate) struct Statistics {
         pub(crate) cutting_blade_usage_time: Option<u64>,

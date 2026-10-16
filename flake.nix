@@ -9,9 +9,6 @@
             inherit (cargoToml.package) name version;
             src = ./.;
             cargoLock.lockFile = ./Cargo.lock;
-            cargoLock.outputHashes = {
-                "homie5-0.10.1" = "sha256-gIzYfXuSgKMzOJ4dEFrlHc+BEWG3vnxt8YZoz1bj8jI=";
-            };
             doCheck = false;
         };
         flakeForSystem = system: let

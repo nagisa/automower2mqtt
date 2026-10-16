@@ -7,7 +7,7 @@ use homie5::device_description::HomieDeviceDescription;
 use homie5::device_description::HomieNodeDescription;
 use homie5::device_description::NodeDescriptionBuilder;
 use homie5::device_description::PropertyDescriptionBuilder;
-use homie5::{HOMIE_UNIT_DEGREE, HOMIE_UNIT_PERCENT};
+use homie5::{HOMIE_UNIT_DEGREE, HOMIE_UNIT_METER, HOMIE_UNIT_PERCENT};
 use homie5::{Homie5DeviceProtocol, HomieDeviceStatus, HomieID};
 use rumqttc::v5::MqttOptions;
 use rumqttc::v5::mqttbytes::v5::LastWill;
@@ -36,6 +36,18 @@ static MOWER_MOWING_PROP_ID: HomieID = HomieID::new_const("mowing");
 static MOWER_PARKED_PROP_ID: HomieID = HomieID::new_const("parked");
 static MOWER_PAUSED_PROP_ID: HomieID = HomieID::new_const("paused");
 static MOWER_INACTIVE_PROP_ID: HomieID = HomieID::new_const("inactive");
+static MOWER_CUTTING_BLADE_USAGE_TIME_PROP_ID: HomieID =
+    HomieID::new_const("cutting-blade-usage-time");
+static MOWER_TOTAL_CUTTING_TIME_PROP_ID: HomieID = HomieID::new_const("total-cutting-time");
+static MOWER_TOTAL_RUNNING_TIME_PROP_ID: HomieID = HomieID::new_const("total-running-time");
+static MOWER_TOTAL_SEARCHING_TIME_PROP_ID: HomieID = HomieID::new_const("total-searching-time");
+static MOWER_TOTAL_CHARGING_TIME_PROP_ID: HomieID = HomieID::new_const("total-charging-time");
+static MOWER_CLOUD_CONNECTED_TIME_PROP_ID: HomieID = HomieID::new_const("cloud-connected-time");
+static MOWER_CLOUD_DISCONNECTED_TIME_PROP_ID: HomieID =
+    HomieID::new_const("cloud-disconnected-time");
+static MOWER_CHARGING_CYCLES_PROP_ID: HomieID = HomieID::new_const("number-of-charging-cycles");
+static MOWER_COLLISIONS_PROP_ID: HomieID = HomieID::new_const("number-of-collisions");
+static MOWER_TOTAL_DRIVE_DISTANCE_PROP_ID: HomieID = HomieID::new_const("total-drive-distance");
 static MOWER_WORK_AREA_ID_PROP_ID: HomieID = HomieID::new_const("work-area");
 static PLANNER_NODE_ID: HomieID = HomieID::new_const("planner");
 static PLANNER_NEXT_START_PROP_ID: HomieID = HomieID::new_const("next-start");
@@ -598,13 +610,12 @@ impl PropertyTask {
             }
             return Err(error);
         }
-        // Work areas and stay-out zones are not covered by the websocket, so have the API poll
-        // for the change.
-        let wait = is_polled_node(self.node_id.as_str()).then(|| {
+        // Not everything is covered by the websocket, so have the API poll for the change.
+        let wait = poll_scope(self.node_id.as_str(), self.prop_id.as_str()).map(|scope| {
             let (node_id, prop_id) = (self.node_id.clone(), self.prop_id.clone());
             let external_inhibits = Arc::clone(&self.external_inhibits);
             let expected = Some(command.expected);
-            self.api.wait_for(move |data| {
+            self.api.wait_for(scope, move |data| {
                 homie_property_value(data, node_id.as_str(), prop_id.as_str(), &external_inhibits)
                     == expected
             })
@@ -742,7 +753,7 @@ enum SetRequest {
     /// `POST /mowers/{id}/{path}`
     Post {
         path: String,
-        body: serde_json::Value,
+        body: Option<serde_json::Value>,
     },
     /// `PATCH /mowers/{id}/{path}`
     Patch {
@@ -796,10 +807,10 @@ fn parse_set(
                 expected,
                 request: SetRequest::Post {
                     path: format!("workAreas/{work_area_id}/calendar"),
-                    body: serde_json::json!({ "data": {
+                    body: Some(serde_json::json!({ "data": {
                         "type": "calendar",
                         "attributes": schemas::automower::CalendarWorkArea { tasks }
-                    }}),
+                    }})),
                 },
             });
         }
@@ -905,6 +916,20 @@ fn parse_set(
             }});
             ("settings", body, val.to_owned())
         }
+        ("mower", "cutting-blade-usage-time") => {
+            // The counter can only be reset, which is what setting it to nothing does.
+            if !val.parse::<jiff::Span>().is_ok_and(|span| span.is_zero()) {
+                tracing::error!(%node_id, %prop_id, %val, "cutting blade usage time can only be set to a zero duration");
+                return None;
+            }
+            return Some(SetCommand {
+                expected: duration_string(0),
+                request: SetRequest::Post {
+                    path: "statistics/resetCuttingBladeUsageTime".to_owned(),
+                    body: None,
+                },
+            });
+        }
         ("mower", "mowing" | "parked" | "paused") => {
             let action = match (prop_id, val) {
                 ("mowing", "yes") | ("parked", "no") | ("paused", "false") => "ResumeSchedule",
@@ -953,7 +978,7 @@ fn parse_set(
         expected,
         request: SetRequest::Post {
             path: path.to_owned(),
-            body,
+            body: Some(body),
         },
     })
 }
@@ -1165,6 +1190,7 @@ impl MowerContext {
         .build();
         let error_code_prop = PropertyDescriptionBuilder::integer().range(0..=724).build();
         let work_area_prop = PropertyDescriptionBuilder::integer().build();
+        let duration_prop = PropertyDescriptionBuilder::duration().build();
         let mowing_prop = PropertyDescriptionBuilder::enumeration([
             "no",
             "yes",
@@ -1200,6 +1226,48 @@ impl MowerContext {
             .add_property(MOWER_PARKED_PROP_ID.clone(), parked_prop)
             .add_property(MOWER_PAUSED_PROP_ID.clone(), paused_prop)
             .add_property(MOWER_INACTIVE_PROP_ID.clone(), inactive_summary_prop)
+            .add_property(
+                MOWER_CUTTING_BLADE_USAGE_TIME_PROP_ID.clone(),
+                // Can only be reset, by setting it to a zero duration.
+                PropertyDescriptionBuilder::duration()
+                    .settable(true)
+                    .build(),
+            )
+            .add_property(
+                MOWER_TOTAL_CUTTING_TIME_PROP_ID.clone(),
+                duration_prop.clone(),
+            )
+            .add_property(
+                MOWER_TOTAL_RUNNING_TIME_PROP_ID.clone(),
+                duration_prop.clone(),
+            )
+            .add_property(
+                MOWER_TOTAL_SEARCHING_TIME_PROP_ID.clone(),
+                duration_prop.clone(),
+            )
+            .add_property(
+                MOWER_TOTAL_CHARGING_TIME_PROP_ID.clone(),
+                duration_prop.clone(),
+            )
+            .add_property(
+                MOWER_CLOUD_CONNECTED_TIME_PROP_ID.clone(),
+                duration_prop.clone(),
+            )
+            .add_property(MOWER_CLOUD_DISCONNECTED_TIME_PROP_ID.clone(), duration_prop)
+            .add_property(
+                MOWER_CHARGING_CYCLES_PROP_ID.clone(),
+                PropertyDescriptionBuilder::integer().build(),
+            )
+            .add_property(
+                MOWER_COLLISIONS_PROP_ID.clone(),
+                PropertyDescriptionBuilder::integer().build(),
+            )
+            .add_property(
+                MOWER_TOTAL_DRIVE_DISTANCE_PROP_ID.clone(),
+                PropertyDescriptionBuilder::integer()
+                    .unit(HOMIE_UNIT_METER)
+                    .build(),
+            )
             .build();
         let restricted_reason_prop = PropertyDescriptionBuilder::enumeration([
             "NONE",
@@ -1461,6 +1529,30 @@ fn homie_property_value(
         ),
         ("mower", "state") => Some(data.mower.state.clone()),
         ("mower", "error-code") => data.mower.error_code.map(|value| value.to_string()),
+        ("mower", "cutting-blade-usage-time") => {
+            statistics_duration(data, |s| s.cutting_blade_usage_time)
+        }
+        ("mower", "total-cutting-time") => statistics_duration(data, |s| s.total_cutting_time),
+        ("mower", "total-running-time") => statistics_duration(data, |s| s.total_running_time),
+        ("mower", "total-searching-time") => statistics_duration(data, |s| s.total_searching_time),
+        ("mower", "total-charging-time") => statistics_duration(data, |s| s.total_charging_time),
+        ("mower", "cloud-connected-time") => statistics_duration(data, |s| s.up_time),
+        ("mower", "cloud-disconnected-time") => statistics_duration(data, |s| s.down_time),
+        ("mower", "number-of-charging-cycles") => data
+            .statistics
+            .as_ref()?
+            .number_of_charging_cycles
+            .map(|value| value.to_string()),
+        ("mower", "number-of-collisions") => data
+            .statistics
+            .as_ref()?
+            .number_of_collisions
+            .map(|value| value.to_string()),
+        ("mower", "total-drive-distance") => data
+            .statistics
+            .as_ref()?
+            .total_drive_distance
+            .map(|value| value.to_string()),
         ("mower", "work-area") => data.mower.work_area_id.map(|value| value.to_string()),
         ("mower", "mowing") => Some(derive_mowing_api(data).to_owned()),
         ("mower", "parked") => Some(derive_parked_api(data).to_owned()),
@@ -1503,6 +1595,13 @@ fn homie_property_value(
             .map(|value| value.mode.clone()),
         _ => None,
     }
+}
+
+fn statistics_duration(
+    data: &schemas::automower::MowerData,
+    seconds: impl FnOnce(&schemas::automower::Statistics) -> Option<u64>,
+) -> Option<String> {
+    seconds(data.statistics.as_ref()?).map(duration_string)
 }
 
 fn derive_mowing_api(data: &schemas::automower::MowerData) -> &'static str {
@@ -1581,6 +1680,22 @@ fn parse_stay_out_zone_node_id(node_id: &str) -> Option<&str> {
             .chars()
             .all(|c| c == '-' || c.is_ascii_digit() || ('a'..='f').contains(&c));
     is_uuid.then_some(zone_id)
+}
+
+/// What has to be read from the API to learn about a change of the property, if the websocket does
+/// not tell us.
+fn poll_scope(node_id: &str, prop_id: &str) -> Option<api::Scope> {
+    let mut scope = api::Scope::default();
+    if parse_work_area_node_id(node_id).is_some() {
+        scope.work_areas = true;
+    } else if parse_stay_out_zone_node_id(node_id).is_some() {
+        scope.stay_out_zones = true;
+    } else if (node_id, prop_id) == ("mower", "cutting-blade-usage-time") {
+        scope.statistics = true;
+    } else {
+        return None;
+    }
+    Some(scope)
 }
 
 /// Whether the node is for something that the API has to be polled for: a work area or a
@@ -1735,6 +1850,12 @@ fn mower_datetime_seconds(since_mower_epoch: i64) -> jiff::civil::DateTime {
     EPOCH
         .checked_add(jiff::Span::new().seconds(since_mower_epoch))
         .expect("adding seconds to epoch should never overflow")
+}
+
+/// ISO 8601 duration, as the Homie `duration` type wants it.
+fn duration_string(seconds: u64) -> String {
+    let seconds = i64::try_from(seconds).expect("durations are within range");
+    jiff::SignedDuration::from_secs(seconds).to_string()
 }
 
 fn mower_degrees_tenths(value: u16) -> String {
