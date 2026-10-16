@@ -55,6 +55,7 @@ the source code. This text provides some most prominent examples:
 * `$prefix/mower/parked/set = yes|no|until-next-schedule`: `yes` will park until further notice,
   `until-next-schedule` is self-explanatory, `no` will “resume”.
 * `$prefix/settings/headlight-mode = ALWAYS_ON|ALWAYS_OFF|EVENING_ONLY|EVENING_AND_NIGHT`;
+* `$prefix/mower/error-code = 0` to confirm a non-fatal error;
 
 ### External inhibits
 

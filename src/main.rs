@@ -70,8 +70,8 @@ static WORK_AREA_OVERLAP_PROP_ID: HomieID = HomieID::new_const("overlap");
 static WORK_AREA_PROGRESS_PROP_ID: HomieID = HomieID::new_const("progress");
 static WORK_AREA_LAST_TIME_COMPLETED_PROP_ID: HomieID = HomieID::new_const("last-time-completed");
 static WORK_AREA_LAST_TIME_ABANDONED_PROP_ID: HomieID = HomieID::new_const("last-time-abandoned");
-static WORK_AREA_USE_GLOBAL_CUTTING_HEIGHT_PROP_ID: HomieID =
-    HomieID::new_const("use-global-cutting-height");
+static WORK_AREA_USES_GLOBAL_CUTTING_HEIGHT_PROP_ID: HomieID =
+    HomieID::new_const("uses-global-cutting-height");
 static WORK_AREA_CALENDAR_PROP_ID: HomieID = HomieID::new_const("calendar");
 static STAY_OUT_ZONE_ID_PROP_ID: HomieID = HomieID::new_const("id");
 static STAY_OUT_ZONE_NAME_PROP_ID: HomieID = HomieID::new_const("name");
@@ -570,8 +570,10 @@ impl PropertyTask {
 
     /// Forward the command to the API and start waiting for the API to report the new value.
     async fn set(&mut self, value: &str) -> Result<(), Error> {
+        let data = self.api.snapshot().await;
         let Some(command) = parse_set(
             &self.external_inhibits,
+            &data,
             self.node_id.as_str(),
             self.prop_id.as_str(),
             value,
@@ -777,6 +779,7 @@ impl SetRequest {
 /// accepted.
 fn parse_set(
     external_inhibits: &[ExternalInhibit],
+    data: &schemas::automower::MowerData,
     node_id: &str,
     prop_id: &str,
     val: &str,
@@ -915,6 +918,24 @@ fn parse_set(
                 "attributes": { "headlight": { "mode": val } }
             }});
             ("settings", body, val.to_owned())
+        }
+        ("mower", "error-code") => {
+            // The error can only be confirmed, which is what setting it to 0 (no error) does.
+            if val.parse::<u16>() != Ok(0) {
+                tracing::error!(%node_id, %prop_id, %val, "error code can only be set to 0");
+                return None;
+            }
+            if data.mower.is_error_confirmable != Some(true) {
+                tracing::warn!(%node_id, "there is no error that could be confirmed");
+                return None;
+            }
+            return Some(SetCommand {
+                expected: "0".to_owned(),
+                request: SetRequest::Post {
+                    path: "errors/confirm".to_owned(),
+                    body: None,
+                },
+            });
         }
         ("mower", "cutting-blade-usage-time") => {
             // The counter can only be reset, which is what setting it to nothing does.
@@ -1215,7 +1236,11 @@ impl MowerContext {
         ])
         .unwrap()
         .build();
-        let error_code_prop = PropertyDescriptionBuilder::integer().range(0..=724).build();
+        // Writing 0 confirms the error, if it can be confirmed.
+        let error_code_prop = PropertyDescriptionBuilder::integer()
+            .range(0..=724)
+            .settable(true)
+            .build();
         let work_area_prop = PropertyDescriptionBuilder::integer().build();
         let duration_prop = PropertyDescriptionBuilder::duration().build();
         let mowing_prop = PropertyDescriptionBuilder::enumeration([
@@ -1526,7 +1551,7 @@ fn homie_property_value(
             "last-time-abandoned" => area
                 .last_time_abandoned
                 .map(|value| mower_datetime_seconds(value).to_string()),
-            "use-global-cutting-height" => area
+            "uses-global-cutting-height" => area
                 .use_global_cutting_height
                 .map(|value| value.to_string()),
             "calendar" => area.calendar.as_ref().map(|calendar| {
@@ -1555,7 +1580,7 @@ fn homie_property_value(
                 .unwrap_or_else(|| "NONE".to_owned()),
         ),
         ("mower", "state") => Some(data.mower.state.clone()),
-        ("mower", "error-code") => data.mower.error_code.map(|value| value.to_string()),
+        ("mower", "error-code") => Some(data.mower.error_code.unwrap_or(0).to_string()),
         ("mower", "cutting-blade-usage-time") => {
             statistics_duration(data, |s| s.cutting_blade_usage_time)
         }
@@ -1809,7 +1834,13 @@ fn work_area_node_description() -> HomieNodeDescription {
             current_orientation,
         )
         .add_property(WORK_AREA_OVERLAP_PROP_ID.clone(), integer.clone())
-        .add_property(WORK_AREA_PROGRESS_PROP_ID.clone(), percentage)
+        .add_property(
+            WORK_AREA_PROGRESS_PROP_ID.clone(),
+            PropertyDescriptionBuilder::integer()
+                .unit(HOMIE_UNIT_PERCENT)
+                .range(0..=100)
+                .build(),
+        )
         .add_property(
             WORK_AREA_LAST_TIME_COMPLETED_PROP_ID.clone(),
             PropertyDescriptionBuilder::datetime().build(),
@@ -1818,7 +1849,10 @@ fn work_area_node_description() -> HomieNodeDescription {
             WORK_AREA_LAST_TIME_ABANDONED_PROP_ID.clone(),
             PropertyDescriptionBuilder::datetime().build(),
         )
-        .add_property(WORK_AREA_USE_GLOBAL_CUTTING_HEIGHT_PROP_ID.clone(), boolean)
+        .add_property(
+            WORK_AREA_USES_GLOBAL_CUTTING_HEIGHT_PROP_ID.clone(),
+            boolean,
+        )
         .add_property(WORK_AREA_CALENDAR_PROP_ID.clone(), json)
         .build()
 }
