@@ -72,6 +72,8 @@ static WORK_AREA_LAST_TIME_COMPLETED_PROP_ID: HomieID = HomieID::new_const("last
 static WORK_AREA_LAST_TIME_ABANDONED_PROP_ID: HomieID = HomieID::new_const("last-time-abandoned");
 static WORK_AREA_USES_GLOBAL_CUTTING_HEIGHT_PROP_ID: HomieID =
     HomieID::new_const("uses-global-cutting-height");
+static WORK_AREA_MOWING_PROP_ID: HomieID = HomieID::new_const("mowing");
+static MOWER_COMMAND_PROP_ID: HomieID = HomieID::new_const("command");
 static WORK_AREA_CALENDAR_PROP_ID: HomieID = HomieID::new_const("calendar");
 static STAY_OUT_ZONE_ID_PROP_ID: HomieID = HomieID::new_const("id");
 static STAY_OUT_ZONE_NAME_PROP_ID: HomieID = HomieID::new_const("name");
@@ -305,6 +307,8 @@ struct PropertyTask {
     prop_id: HomieID,
     settable: bool,
     retained: bool,
+    /// Commands are events with nothing to track: no value and no `$target`.
+    momentary: bool,
     inputs: mpsc::UnboundedReceiver<PropertyTaskMessage>,
     api_changes: watch::Receiver<u64>,
     ready: watch::Receiver<bool>,
@@ -560,12 +564,7 @@ impl PropertyTask {
 
     async fn api_value(&self) -> Option<String> {
         let snapshot = self.api.snapshot().await;
-        homie_property_value(
-            &snapshot,
-            self.node_id.as_str(),
-            self.prop_id.as_str(),
-            &self.external_inhibits,
-        )
+        homie_property_value(&snapshot, self.node_id.as_str(), self.prop_id.as_str())
     }
 
     /// Forward the command to the API and start waiting for the API to report the new value.
@@ -580,11 +579,23 @@ impl PropertyTask {
         ) else {
             return self.reject().await;
         };
+        let Some(expected) = command.expected else {
+            // Momentary: once the API took the command, it is announced as an event.
+            command
+                .request
+                .send(&self.api_client, self.api.id())
+                .await?;
+            if *self.ready.borrow() {
+                self.publish_value(Some(value.to_owned()), true).await?;
+            }
+            return Ok(());
+        };
         // The command is accepted, so `$target` goes first, then the request that starts the
         // transition is made.
+        let nothing = matches!(command.request, SetRequest::Nothing);
         let previous = self.pending_target.replace(PendingTarget {
             requested: value.to_owned(),
-            expected: command.expected.clone(),
+            expected: expected.clone(),
             deadline: tokio::time::Instant::now() + PROPERTY_TARGET_TIMEOUT,
             _wait: None,
         });
@@ -615,23 +626,25 @@ impl PropertyTask {
         // Not everything is covered by the websocket, so have the API poll for the change.
         let wait = poll_scope(self.node_id.as_str(), self.prop_id.as_str()).map(|scope| {
             let (node_id, prop_id) = (self.node_id.clone(), self.prop_id.clone());
-            let external_inhibits = Arc::clone(&self.external_inhibits);
-            let expected = Some(command.expected);
+            let expected = Some(expected);
             self.api.wait_for(scope, move |data| {
-                homie_property_value(data, node_id.as_str(), prop_id.as_str(), &external_inhibits)
-                    == expected
+                homie_property_value(data, node_id.as_str(), prop_id.as_str()) == expected
             })
         });
         if let Some(pending) = &mut self.pending_target {
             pending.deadline = tokio::time::Instant::now() + PROPERTY_TARGET_TIMEOUT;
             pending._wait = wait;
         }
+        if nothing {
+            // The property may already be what was asked for.
+            self.publish_api_state().await?;
+        }
         Ok(())
     }
 
     /// Tell controllers that a command was not accepted by publishing the unchanged target again.
     async fn reject(&mut self) -> Result<(), Error> {
-        if !*self.ready.borrow() {
+        if self.momentary || !*self.ready.borrow() {
             return Ok(());
         }
         let target = match &self.pending_target {
@@ -643,7 +656,7 @@ impl PropertyTask {
 
     /// Publish what the API currently reports, unless that is what is already published.
     async fn publish_api_state(&mut self) -> Result<(), Error> {
-        if !*self.ready.borrow() {
+        if self.momentary || !*self.ready.borrow() {
             return Ok(());
         }
         let value = self.api_value().await;
@@ -680,6 +693,9 @@ impl PropertyTask {
     }
 
     async fn publish_all(&mut self) -> Result<(), Error> {
+        if self.momentary {
+            return Ok(());
+        }
         let value = self.api_value().await;
         if self.settable {
             let target = match (&self.pending_target, &self.last_value, &self.last_target) {
@@ -746,8 +762,9 @@ impl PropertyTask {
 
 /// A validated `set` command, ready to be sent to the API.
 struct SetCommand {
-    /// What the property is going to read once the API reflects the command.
-    expected: String,
+    /// What the property is going to read once the API reflects the command. `None` for the
+    /// momentary commands, which have no state to wait for.
+    expected: Option<String>,
     request: SetRequest,
 }
 
@@ -762,6 +779,99 @@ enum SetRequest {
         path: String,
         body: serde_json::Value,
     },
+    /// The command is accepted but there is nothing to be done.
+    Nothing,
+}
+
+/// The payload of the `mower/command` property.
+#[derive(serde::Deserialize)]
+#[serde(tag = "command", rename_all = "kebab-case", deny_unknown_fields)]
+enum MowerCommand {
+    Start {
+        #[serde(rename = "work-area")]
+        work_area: Option<i64>,
+        duration: Option<String>,
+    },
+    Park {
+        duration: Option<String>,
+        until: Option<ParkUntil>,
+    },
+    Pause {},
+    Resume {},
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum ParkUntil {
+    NextSchedule,
+    FurtherNotice,
+}
+
+/// The ISO 8601 duration in the minutes that the API wants, rounded to the closest one.
+fn duration_minutes(duration: &str) -> Option<u32> {
+    let seconds = duration.parse::<jiff::SignedDuration>().ok()?.as_secs();
+    let minutes = u32::try_from((seconds + 30).div_euclid(60)).ok()?;
+    (1..=65_000).contains(&minutes).then_some(minutes)
+}
+
+fn action(body: serde_json::Value) -> SetRequest {
+    SetRequest::Post {
+        path: "actions".to_owned(),
+        body: Some(serde_json::json!({ "data": body })),
+    }
+}
+
+fn parse_mower_command(val: &str) -> Option<SetRequest> {
+    let command = serde_json::from_str::<MowerCommand>(val)
+        .inspect_err(|error| tracing::error!(%error, %val, "invalid mower command"))
+        .ok()?;
+    let minutes = |duration: &str| {
+        let minutes = duration_minutes(duration);
+        if minutes.is_none() {
+            tracing::error!(%duration, "duration must be between 1 and 65000 minutes");
+        }
+        minutes
+    };
+    Some(match command {
+        MowerCommand::Start {
+            work_area: None,
+            duration: Some(d),
+        } => action(serde_json::json!({
+            "type": "Start",
+            "attributes": { "duration": minutes(&d)? }
+        })),
+        MowerCommand::Start {
+            work_area: Some(work_area_id),
+            duration,
+        } => {
+            let mut attributes = serde_json::json!({ "workAreaId": work_area_id });
+            if let Some(d) = duration {
+                attributes["duration"] = minutes(&d)?.into();
+            }
+            action(serde_json::json!({ "type": "StartInWorkArea", "attributes": attributes }))
+        }
+        MowerCommand::Park {
+            duration: Some(d),
+            until: None,
+        } => action(serde_json::json!({
+            "type": "Park",
+            "attributes": { "duration": minutes(&d)? }
+        })),
+        MowerCommand::Park {
+            duration: None,
+            until: Some(ParkUntil::NextSchedule),
+        } => action(serde_json::json!({ "type": "ParkUntilNextSchedule" })),
+        MowerCommand::Park {
+            duration: None,
+            until: Some(ParkUntil::FurtherNotice),
+        } => action(serde_json::json!({ "type": "ParkUntilFurtherNotice" })),
+        MowerCommand::Pause {} => action(serde_json::json!({ "type": "Pause" })),
+        MowerCommand::Resume {} => action(serde_json::json!({ "type": "ResumeSchedule" })),
+        MowerCommand::Start { .. } | MowerCommand::Park { .. } => {
+            tracing::error!(%val, "the mower command lacks, or has too many, of the parameters it needs");
+            return None;
+        }
+    })
 }
 
 impl SetRequest {
@@ -769,6 +879,7 @@ impl SetRequest {
         match self {
             SetRequest::Post { path, body } => api_client.post_mower(mower_id, &path, body).await,
             SetRequest::Patch { path, body } => api_client.patch_mower(mower_id, &path, body).await,
+            SetRequest::Nothing => Ok(()),
         }
     }
 }
@@ -803,6 +914,7 @@ fn parse_set(
                 task.work_area_id = None;
             }
             let expected = serde_json::to_string(&tasks).expect("calendar schema is serializable");
+            let expected = Some(expected);
             for task in &mut tasks {
                 task.work_area_id = Some(work_area_id);
             }
@@ -815,6 +927,25 @@ fn parse_set(
                         "attributes": schemas::automower::CalendarWorkArea { tasks }
                     }})),
                 },
+            });
+        }
+        if prop_id == "mowing" {
+            let request = match val {
+                "yes" => action(serde_json::json!({
+                    "type": "StartInWorkArea",
+                    "attributes": { "workAreaId": work_area_id }
+                })),
+                // Only mowing in this very work area is stopped.
+                "no" if derive_area_mowing(data, work_area_id) == "no" => SetRequest::Nothing,
+                "no" => action(serde_json::json!({ "type": "Pause" })),
+                _ => {
+                    tracing::error!(%node_id, %val, "invalid value");
+                    return None;
+                }
+            };
+            return Some(SetCommand {
+                expected: Some(val.to_owned()),
+                request,
             });
         }
         let (attributes, expected) = match prop_id {
@@ -869,7 +1000,7 @@ fn parse_set(
             _ => unreachable!("only the settable work area properties are subscribed to"),
         };
         return Some(SetCommand {
-            expected,
+            expected: Some(expected),
             request: SetRequest::Patch {
                 path: format!("workAreas/{work_area_id}"),
                 body: serde_json::json!({ "data": {
@@ -889,7 +1020,7 @@ fn parse_set(
             return None;
         };
         return Some(SetCommand {
-            expected: enable.to_string(),
+            expected: Some(enable.to_string()),
             request: SetRequest::Patch {
                 path: format!("stayOutZones/{zone_id}"),
                 body: serde_json::json!({ "data": {
@@ -910,14 +1041,20 @@ fn parse_set(
                 "type": "settings",
                 "attributes": { "cuttingHeight": height }
             }});
-            ("settings", body, height.to_string())
+            ("settings", body, Some(height.to_string()))
         }
         ("settings", "headlight-mode") => {
             let body = serde_json::json!({ "data": {
                 "type": "settings",
                 "attributes": { "headlight": { "mode": val } }
             }});
-            ("settings", body, val.to_owned())
+            ("settings", body, Some(val.to_owned()))
+        }
+        ("mower", "command") => {
+            return Some(SetCommand {
+                expected: None,
+                request: parse_mower_command(val)?,
+            });
         }
         ("mower", "error-code") => {
             // The error can only be confirmed, which is what setting it to 0 (no error) does.
@@ -930,7 +1067,7 @@ fn parse_set(
                 return None;
             }
             return Some(SetCommand {
-                expected: "0".to_owned(),
+                expected: Some("0".to_owned()),
                 request: SetRequest::Post {
                     path: "errors/confirm".to_owned(),
                     body: None,
@@ -944,7 +1081,7 @@ fn parse_set(
                 return None;
             }
             return Some(SetCommand {
-                expected: duration_string(0),
+                expected: Some(duration_string(0)),
                 request: SetRequest::Post {
                     path: "statistics/resetCuttingBladeUsageTime".to_owned(),
                     body: None,
@@ -952,24 +1089,19 @@ fn parse_set(
             });
         }
         ("mower", "mowing" | "parked" | "paused") => {
+            // Starting or parking for a duration is what the `command` property is for.
             let action = match (prop_id, val) {
                 ("mowing", "yes") | ("parked", "no") | ("paused", "false") => "ResumeSchedule",
                 ("mowing", "no") | ("paused", "true") => "Pause",
                 ("parked", "yes") => "ParkUntilFurtherNotice",
                 ("parked", "until-next-schedule") => "ParkUntilNextSchedule",
-                ("mowing", "forced-for-duration" | "forced-in-workarea")
-                | ("parked", "for-duration") => {
-                    // TODO: figure out how to pass parameters.
-                    tracing::warn!(%node_id, %prop_id, %val, "value not supported yet");
-                    return None;
-                }
                 _ => {
                     tracing::error!(%node_id, %prop_id, %val, "invalid value");
                     return None;
                 }
             };
             let body = serde_json::json!({ "data": { "type": action } });
-            ("actions", body, val.to_owned())
+            ("actions", body, Some(val.to_owned()))
         }
         ("planner", prop_id) => {
             let inhibit = external_inhibits
@@ -991,7 +1123,8 @@ fn parse_set(
                     "externalReason": inhibit.reason
                 }
             }});
-            ("actions", body, val.to_owned())
+            // A momentary command: there is no state to follow.
+            ("actions", body, None)
         }
         _ => unreachable!("only the settable properties are subscribed to"),
     };
@@ -1279,6 +1412,14 @@ impl MowerContext {
             .add_property(MOWER_PAUSED_PROP_ID.clone(), paused_prop)
             .add_property(MOWER_INACTIVE_PROP_ID.clone(), inactive_summary_prop)
             .add_property(
+                MOWER_COMMAND_PROP_ID.clone(),
+                // A command, such as to start for a while: not a state, so it has no value.
+                PropertyDescriptionBuilder::json()
+                    .settable(true)
+                    .retained(false)
+                    .build(),
+            )
+            .add_property(
                 MOWER_CUTTING_BLADE_USAGE_TIME_PROP_ID.clone(),
                 // Can only be reset, by setting it to a zero duration.
                 PropertyDescriptionBuilder::duration()
@@ -1428,6 +1569,7 @@ impl MowerContext {
                     prop_id: prop_id.clone(),
                     settable: prop.settable,
                     retained: prop.retained,
+                    momentary: is_momentary(node_id.as_str(), prop_id.as_str()),
                     inputs,
                     api_changes: self.api.subscribe(),
                     ready: self.property_ready.subscribe(),
@@ -1510,7 +1652,6 @@ fn homie_property_value(
     data: &schemas::automower::MowerData,
     node_id: &str,
     prop_id: &str,
-    external_inhibits: &[ExternalInhibit],
 ) -> Option<String> {
     if let Some(zone_id) = parse_stay_out_zone_node_id(node_id) {
         let zones = data.stay_out_zones.as_ref()?;
@@ -1535,6 +1676,7 @@ fn homie_property_value(
             .iter()
             .find(|area| area.work_area_id == Some(id))?;
         return match prop_id {
+            "mowing" => Some(derive_area_mowing(data, id).to_owned()),
             "name" => area.name.clone(),
             "type" => area.r#type.clone(),
             "cutting-height" => area.cutting_height.map(|value| value.to_string()),
@@ -1624,16 +1766,6 @@ fn homie_property_value(
         ("planner", "external-reason") => {
             data.planner.external_reason.map(|value| value.to_string())
         }
-        ("planner", prop_id) if prop_id.starts_with("external-inhibit-") => {
-            let inhibit = external_inhibits
-                .iter()
-                .find(|inhibit| inhibit.name.as_str() == prop_id)?;
-            Some(if data.planner.external_reason == Some(inhibit.reason) {
-                "enable".to_owned()
-            } else {
-                "disable".to_owned()
-            })
-        }
         ("settings", "cutting-height") => data
             .settings
             .as_ref()?
@@ -1674,6 +1806,18 @@ fn derive_mowing_api(data: &schemas::automower::MowerData) -> &'static str {
             }
         }
         "MOWING" => "yes",
+        _ => "no",
+    }
+}
+
+/// The `mowing` of the mower, if it is in the work area.
+fn derive_area_mowing(data: &schemas::automower::MowerData, work_area_id: i64) -> &'static str {
+    match derive_mowing_api(data) {
+        mowing @ ("yes" | "forced-in-workarea")
+            if data.mower.work_area_id == Some(work_area_id) =>
+        {
+            mowing
+        }
         _ => "no",
     }
 }
@@ -1734,11 +1878,17 @@ fn parse_stay_out_zone_node_id(node_id: &str) -> Option<&str> {
     is_uuid.then_some(zone_id)
 }
 
+/// Properties that are events, not state.
+fn is_momentary(node_id: &str, prop_id: &str) -> bool {
+    (node_id, prop_id) == ("mower", "command")
+        || node_id == "planner" && prop_id.starts_with("external-inhibit-")
+}
+
 /// What has to be read from the API to learn about a change of the property, if the websocket does
 /// not tell us.
 fn poll_scope(node_id: &str, prop_id: &str) -> Option<api::Scope> {
     let mut scope = api::Scope::default();
-    if parse_work_area_node_id(node_id).is_some() {
+    if parse_work_area_node_id(node_id).is_some() && prop_id != "mowing" {
         scope.work_areas = true;
     } else if parse_stay_out_zone_node_id(node_id).is_some()
         || (node_id, prop_id) == ("mower", "cutting-blade-usage-time")
@@ -1821,6 +1971,13 @@ fn work_area_node_description() -> HomieNodeDescription {
             .build();
     let json = PropertyDescriptionBuilder::json().settable(true).build();
     NodeDescriptionBuilder::new()
+        .add_property(
+            WORK_AREA_MOWING_PROP_ID.clone(),
+            PropertyDescriptionBuilder::enumeration(["no", "yes", "forced-in-workarea"])
+                .expect("work area mowing enum is valid")
+                .settable(true)
+                .build(),
+        )
         .add_property(WORK_AREA_ID_PROP_ID.clone(), integer.clone())
         .add_property(WORK_AREA_NAME_PROP_ID.clone(), string.clone())
         .add_property(WORK_AREA_TYPE_PROP_ID.clone(), work_area_type)

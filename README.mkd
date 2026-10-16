@@ -42,7 +42,8 @@ somehow also specify the restricted code, which would require synchronization be
 properties.
 
 Instead this bridge introduces separate properties that are intent focused and potentially
-overlapping in their meaning.
+overlapping in their meaning. There is also an escape hatch at `$prefix/mower/command` that allows
+full range of different commands that the API exposes (such as duration-limited mowing.)
 
 ### Examples of settable properties
 
@@ -70,6 +71,6 @@ as long as rain is being detected. Once the rain stops and your automation stops
 `enable` command, the mower will continue waiting for 25 further hours (1500 minutes as specified
 in the argument) for the lawn to dry off a bit more.
 
-You can specify as many such different inhibitors as you want. You might want another one for `dew`
-that prevents mowing just for an hour or two on certain mornings, or a `bbq` inhibitor that lasts
-for 8 hours so that the mower does not interfere with your party.
+You can specify as many (within the permitted ID range) such different inhibitors as you want. You
+might want another one for `dew` that prevents mowing just for an hour or two on certain mornings,
+or a `bbq` inhibitor that lasts for 8 hours so that the mower does not interfere with your party.
