@@ -12,8 +12,9 @@ const API_BASE: &str = "https://api.amc.husqvarna.dev/v1";
 const TOKEN_URL: &str = "https://api.authentication.husqvarnagroup.dev/v1/oauth2/token";
 const TOKEN_EXPIRATION_HEADROOM: Duration = Duration::from_secs(30);
 const POLL_INTERVAL: Duration = Duration::from_secs(15 * 60);
-/// Statistics change slowly and the API only allows so many requests, so they are read less often.
-const STATISTICS_POLL_INTERVAL: Duration = Duration::from_secs(60 * 60);
+/// Events from a mower that is believed to be disconnected cause the mower to be read, but not
+/// more often than this.
+const MIN_REQUESTED_MOWER_READ_GAP: Duration = Duration::from_secs(30);
 const REFRESH_TIMEOUT: Duration = Duration::from_secs(30);
 /// Delays between the successive reads while somebody is waiting for a change to show up. Once these run out, the regular poll interval applies again.
 const WAIT_POLL_DELAYS: [Duration; 5] = [
@@ -28,22 +29,20 @@ const WAIT_POLL_DELAYS: [Duration; 5] = [
 #[derive(Clone, Copy, Default)]
 pub(crate) struct Scope {
     pub(crate) work_areas: bool,
-    pub(crate) stay_out_zones: bool,
-    pub(crate) statistics: bool,
+    /// The mower data other than the work areas.
+    pub(crate) mower: bool,
 }
 
 impl Scope {
     const ALL: Scope = Scope {
         work_areas: true,
-        stay_out_zones: true,
-        statistics: true,
+        mower: true,
     };
 
     fn union(self, other: Scope) -> Scope {
         Scope {
             work_areas: self.work_areas || other.work_areas,
-            stay_out_zones: self.stay_out_zones || other.stay_out_zones,
-            statistics: self.statistics || other.statistics,
+            mower: self.mower || other.mower,
         }
     }
 }
@@ -197,7 +196,10 @@ impl Client {
                         let mower = self.mowers.lock().await.get(id).cloned();
                         if let Some(mower) = mower {
                             if mower.apply_event(&event).await {
-                                mower.request_refresh();
+                                mower.request_refresh(Scope {
+                                    work_areas: true,
+                                    ..Scope::default()
+                                });
                             }
                         } else {
                             tracing::warn!(%id, "received event for an unknown mower");
@@ -211,8 +213,8 @@ impl Client {
         }
     }
 
-    /// Keeps the work areas, the stay-out zones and the statistics up to date, as they are not
-    /// covered by the websocket.
+    /// Keeps the work areas and the rest of the mower data up to date, as the websocket does not
+    /// tell about everything.
     ///
     /// Reads them periodically, whenever the mower asks for it, and at a quicker pace for as long
     /// as somebody is waiting for a change to show up (see `Mower::wait_for`). Reading the work
@@ -220,16 +222,21 @@ impl Client {
     async fn refresh_loop(self: Arc<Self>, mower: Arc<Mower>) {
         use tokio::time::Instant;
         let mut periodic = Instant::now();
-        // The statistics were read along with the mower itself.
-        let mut statistics_due = Instant::now() + STATISTICS_POLL_INTERVAL;
         let mut quick: Option<Instant> = None;
         let mut quick_attempt = 0;
+        let mut last_mower_read: Option<Instant> = None;
         loop {
             let wake = quick.map_or(periodic, |quick| quick.min(periodic));
             let mut scope = Scope::default();
             tokio::select! {
                 _ = tokio::time::sleep_until(wake) => {}
-                _ = mower.refresh_requested.notified() => scope.work_areas = true,
+                _ = mower.refresh_requested.notified() => {
+                    scope = std::mem::take(&mut *mower.requested_scope.lock().unwrap());
+                    // A disconnected mower can be sending events at any pace.
+                    if scope.mower && last_mower_read.is_some_and(|read| read.elapsed() < MIN_REQUESTED_MOWER_READ_GAP) {
+                        scope.mower = false;
+                    }
+                }
                 _ = mower.waiters_changed.notified() => {
                     if mower.has_waiters() {
                         let soonest = Instant::now() + WAIT_POLL_DELAYS[0];
@@ -244,9 +251,7 @@ impl Client {
             let now = Instant::now();
             let periodic_due = periodic <= now;
             if periodic_due {
-                scope.work_areas = true;
-                scope.stay_out_zones = true;
-                scope.statistics |= statistics_due <= now;
+                scope = Scope::ALL;
             }
             if quick.is_some_and(|quick| quick <= now) {
                 scope = scope.union(mower.waiters_scope());
@@ -260,11 +265,11 @@ impl Client {
                 Err(_) => tracing::warn!(mower_id=%mower.id(), "mower data refresh timed out"),
             }
             let now = Instant::now();
-            if scope.work_areas && scope.stay_out_zones {
+            if scope.work_areas && scope.mower {
                 periodic = now + POLL_INTERVAL;
             }
-            if scope.statistics {
-                statistics_due = now + STATISTICS_POLL_INTERVAL;
+            if scope.mower {
+                last_mower_read = Some(now);
             }
             mower.notify_waiters().await;
             quick = match WAIT_POLL_DELAYS.get(quick_attempt) {
@@ -414,7 +419,7 @@ impl Client {
 
     /// Read what is in `scope` from the API.
     async fn refresh(&self, mower: &Mower, scope: Scope) -> Result<(), Error> {
-        let (work_areas, stay_out_zones, statistics) = futures::join!(
+        let (work_areas, mower_state) = futures::join!(
             async {
                 match scope.work_areas {
                     true => self.refresh_work_areas(mower).await,
@@ -422,30 +427,22 @@ impl Client {
                 }
             },
             async {
-                match scope.stay_out_zones {
-                    true => self.refresh_stay_out_zones(mower).await,
-                    false => Ok(()),
-                }
-            },
-            async {
-                match scope.statistics {
-                    true => self.refresh_statistics(mower).await,
+                match scope.mower {
+                    true => self.refresh_mower(mower).await,
                     false => Ok(()),
                 }
             },
         );
-        work_areas.and(stay_out_zones).and(statistics)
+        work_areas.and(mower_state)
     }
 
-    /// Read the statistics of the mower and store them.
-    async fn refresh_statistics(&self, mower: &Mower) -> Result<(), Error> {
+    /// Read the current state of the mower, other than the work areas.
+    async fn refresh_mower(&self, mower: &Mower) -> Result<(), Error> {
         let uri = format!("/mowers/{}", mower.id());
         let document = self
             .get::<schemas::automower::JsonApiDataDocument>(&uri)
             .await?;
-        mower
-            .replace_statistics(document.data.attributes.statistics)
-            .await;
+        mower.replace_mower(document.data.attributes).await;
         Ok(())
     }
 
@@ -466,18 +463,6 @@ impl Client {
         mower.replace_work_areas(work_areas).await;
         Ok(())
     }
-
-    /// Read all stay-out zones of the mower with a single request and store them.
-    async fn refresh_stay_out_zones(&self, mower: &Mower) -> Result<(), Error> {
-        let uri = format!("/mowers/{}/stayOutZones", mower.id());
-        let document = self
-            .get::<schemas::automower::JsonApiDataDocumentStayOutZones>(&uri)
-            .await?;
-        mower
-            .replace_stay_out_zones(document.data.map(|data| data.attributes))
-            .await;
-        Ok(())
-    }
 }
 
 struct Waiter {
@@ -490,6 +475,7 @@ pub(crate) struct Mower {
     data: Mutex<schemas::automower::MowerData>,
     changed: watch::Sender<u64>,
     refresh_requested: Notify,
+    requested_scope: std::sync::Mutex<Scope>,
     waiters_changed: Notify,
     waiters: std::sync::Mutex<std::collections::BTreeMap<u64, Waiter>>,
     next_waiter: std::sync::atomic::AtomicU64,
@@ -516,14 +502,17 @@ impl Mower {
             data: Mutex::new(data),
             changed,
             refresh_requested: Notify::new(),
+            requested_scope: Default::default(),
             waiters_changed: Notify::new(),
             waiters: Default::default(),
             next_waiter: Default::default(),
         }
     }
 
-    /// Have the work areas read now.
-    pub(crate) fn request_refresh(&self) {
+    /// Have what is in `scope` read now.
+    pub(crate) fn request_refresh(&self, scope: Scope) {
+        let mut requested = self.requested_scope.lock().unwrap();
+        *requested = requested.union(scope);
         self.refresh_requested.notify_one();
     }
 
@@ -592,32 +581,17 @@ impl Mower {
         self.changed.send_modify(|revision| *revision += 1);
     }
 
-    pub(crate) async fn replace_statistics(
-        &self,
-        statistics: Option<schemas::automower::Statistics>,
-    ) {
+    /// Replace everything with freshly read mower data.
+    ///
+    /// The work areas are the exception, as the mower data only has summaries of them. They are
+    /// read separately.
+    pub(crate) async fn replace_mower(&self, mut new: schemas::automower::MowerData) {
         let changed = {
             let mut data = self.data.lock().await;
-            let differs = data.statistics != statistics;
+            new.work_areas = data.work_areas.take();
+            let differs = *data != new;
             if differs {
-                data.statistics = statistics;
-            }
-            differs
-        };
-        if changed {
-            self.notify_changed();
-        }
-    }
-
-    pub(crate) async fn replace_stay_out_zones(
-        &self,
-        stay_out_zones: Option<schemas::automower::StayOutZones>,
-    ) {
-        let changed = {
-            let mut data = self.data.lock().await;
-            let differs = data.stay_out_zones != stay_out_zones;
-            if differs {
-                data.stay_out_zones = stay_out_zones;
+                *data = new;
             }
             differs
         };
@@ -642,7 +616,7 @@ impl Mower {
 
     pub(crate) async fn apply_event(&self, event: &schemas::websocket::Event) -> bool {
         use schemas::websocket::Event;
-        let (changed, mower_state_changed) = {
+        let (changed, mower_state_changed, disconnected) = {
             let mut data = self.data.lock().await;
             let mut changed = false;
             let mut mower_state_changed = false;
@@ -776,10 +750,19 @@ impl Mower {
                 }
                 Event::MessageEventV2 { .. } => {}
             }
-            (changed, mower_state_changed)
+            (changed, mower_state_changed, !data.metadata.connected)
         };
         if changed {
             self.notify_changed();
+        }
+        if disconnected {
+            // Only a connected mower has events to report. Read what the API says now, rather
+            // than act on this event alone, which would not tell about anything else that changed
+            // while the mower was away.
+            self.request_refresh(Scope {
+                mower: true,
+                ..Scope::default()
+            });
         }
         mower_state_changed
     }

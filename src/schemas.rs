@@ -28,7 +28,7 @@ pub(crate) mod automower {
         pub(crate) attributes: MowerData,
     }
 
-    #[derive(Debug, Clone, serde::Deserialize)]
+    #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
     #[serde(rename_all = "camelCase")]
     pub(crate) struct MowerData {
         pub(crate) system: System,
@@ -45,7 +45,7 @@ pub(crate) mod automower {
         pub(crate) work_areas: Option<Vec<WorkArea>>,
     }
 
-    #[derive(Debug, Clone, serde::Deserialize)]
+    #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
     #[serde(rename_all = "camelCase")]
     pub(crate) struct System {
         pub(crate) name: String,
@@ -53,13 +53,13 @@ pub(crate) mod automower {
         pub(crate) serial_number: u32,
     }
 
-    #[derive(Debug, Clone, serde::Deserialize)]
+    #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
     #[serde(rename_all = "camelCase")]
     pub(crate) struct Battery {
         pub(crate) battery_percent: u8,
     }
 
-    #[derive(Debug, Clone, serde::Deserialize)]
+    #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
     #[serde(rename_all = "camelCase")]
     pub(crate) struct Capabilities {
         pub(crate) can_confirm_error: bool,
@@ -69,7 +69,7 @@ pub(crate) mod automower {
         pub(crate) work_areas: bool,
     }
 
-    #[derive(Debug, Clone, serde::Deserialize)]
+    #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
     #[serde(rename_all = "camelCase")]
     pub(crate) struct MowerApp {
         pub(crate) mode: String,
@@ -82,7 +82,7 @@ pub(crate) mod automower {
         pub(crate) is_error_confirmable: Option<bool>,
     }
 
-    #[derive(Debug, Clone, serde::Deserialize)]
+    #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
     #[serde(rename_all = "camelCase")]
     pub(crate) struct Calendar {
         pub(crate) tasks: Vec<CalendarTask>,
@@ -118,7 +118,7 @@ pub(crate) mod automower {
         pub(crate) tasks: Vec<CalendarTask>,
     }
 
-    #[derive(Debug, Clone, serde::Deserialize)]
+    #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
     #[serde(rename_all = "camelCase")]
     pub(crate) struct Planner {
         pub(crate) next_start_timestamp: u64,
@@ -127,13 +127,13 @@ pub(crate) mod automower {
         pub(crate) external_reason: Option<i32>,
     }
 
-    #[derive(Debug, Clone, serde::Deserialize)]
+    #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
     #[serde(rename_all = "camelCase")]
     pub(crate) struct PlannerOverride {
         pub(crate) action: String,
     }
 
-    #[derive(Debug, Clone, serde::Deserialize)]
+    #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
     #[serde(rename_all = "camelCase")]
     pub(crate) struct Metadata {
         pub(crate) connected: bool,
@@ -216,14 +216,14 @@ pub(crate) mod automower {
             .transpose()
     }
 
-    #[derive(Debug, serde::Deserialize, Clone)]
+    #[derive(Debug, serde::Deserialize, Clone, PartialEq)]
     #[serde(rename_all = "camelCase")]
     pub(crate) struct Position {
         pub(crate) latitude: Option<f64>,
         pub(crate) longitude: Option<f64>,
     }
 
-    #[derive(Debug, Clone, serde::Deserialize)]
+    #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
     #[serde(rename_all = "camelCase")]
     pub(crate) struct Settings {
         pub(crate) cutting_height: Option<u8>,
@@ -237,7 +237,7 @@ pub(crate) mod automower {
         pub(crate) mode: String,
     }
 
-    #[derive(Debug, Clone, serde::Deserialize)]
+    #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
     #[serde(rename_all = "camelCase")]
     pub(crate) struct Timer {
         pub(crate) date_time: Option<i64>,
@@ -280,16 +280,6 @@ pub(crate) mod automower {
     pub(crate) struct StayOutZones {
         pub(crate) dirty: Option<bool>,
         pub(crate) zones: Option<Vec<StayOutZone>>,
-    }
-
-    #[derive(Debug, serde::Deserialize)]
-    pub(crate) struct JsonApiDataDocumentStayOutZones {
-        pub(crate) data: Option<JsonApiDataStayOutZones>,
-    }
-
-    #[derive(Debug, serde::Deserialize)]
-    pub(crate) struct JsonApiDataStayOutZones {
-        pub(crate) attributes: StayOutZones,
     }
 
     #[derive(Debug, Clone, PartialEq, serde::Deserialize)]

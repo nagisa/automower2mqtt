@@ -997,7 +997,29 @@ impl MowerContext {
 
     async fn synchronize_from_api(&mut self) -> Result<(), Error> {
         let data = self.api.snapshot().await;
-        self.update_dynamic_nodes(dynamic_nodes(&data)).await
+        // The state of the device is the state of the mower's connection to the cloud: commands
+        // cannot be sent and the values are not going to change while it is not connected.
+        if data.metadata.connected {
+            self.update_dynamic_nodes(dynamic_nodes(&data)).await
+        } else {
+            self.disconnect().await
+        }
+    }
+
+    async fn disconnect(&mut self) -> Result<(), Error> {
+        if self.status == HomieDeviceStatus::Disconnected {
+            return Ok(());
+        }
+        let old_status = self.status;
+        self.status = HomieDeviceStatus::Disconnected;
+        self.property_ready.send_replace(false);
+        let result = self.publish_device_state(self.status).await;
+        if result.is_err() {
+            self.status = old_status;
+            self.property_ready
+                .send_replace(old_status == HomieDeviceStatus::Ready);
+        }
+        result
     }
 
     async fn send_property_message(
@@ -1048,7 +1070,8 @@ impl MowerContext {
         Ok(())
     }
 
-    /// Make the set of the nodes for work areas and stay-out zones match `wanted`.
+    /// Make the set of the nodes for work areas and stay-out zones match `wanted`, and bring the
+    /// device back up if it was disconnected.
     ///
     /// Per the Homie convention, a change to the description requires the device to go through
     /// `init` before it becomes `ready` again, so the description gets republished from scratch.
@@ -1062,7 +1085,8 @@ impl MowerContext {
             .iter()
             .filter(|(id, _)| is_polled_node(id.as_str()))
             .collect::<BTreeMap<_, _>>();
-        if old_nodes.keys().copied().eq(wanted.keys()) {
+        let reconnected = self.status == HomieDeviceStatus::Disconnected;
+        if !reconnected && old_nodes.keys().copied().eq(wanted.keys()) {
             return Ok(());
         }
         let removed = old_nodes
@@ -1078,7 +1102,10 @@ impl MowerContext {
         description.nodes.extend(wanted);
         description.update_version();
         let old_status = self.status;
-        if old_status == HomieDeviceStatus::Ready {
+        if matches!(
+            old_status,
+            HomieDeviceStatus::Ready | HomieDeviceStatus::Disconnected
+        ) {
             self.status = HomieDeviceStatus::Init;
             self.property_ready.send_replace(false);
         }
@@ -1688,10 +1715,10 @@ fn poll_scope(node_id: &str, prop_id: &str) -> Option<api::Scope> {
     let mut scope = api::Scope::default();
     if parse_work_area_node_id(node_id).is_some() {
         scope.work_areas = true;
-    } else if parse_stay_out_zone_node_id(node_id).is_some() {
-        scope.stay_out_zones = true;
-    } else if (node_id, prop_id) == ("mower", "cutting-blade-usage-time") {
-        scope.statistics = true;
+    } else if parse_stay_out_zone_node_id(node_id).is_some()
+        || (node_id, prop_id) == ("mower", "cutting-blade-usage-time")
+    {
+        scope.mower = true;
     } else {
         return None;
     }
