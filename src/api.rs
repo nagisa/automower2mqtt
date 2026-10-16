@@ -601,16 +601,14 @@ impl Mower {
                             &mut data.planner.next_start_timestamp,
                             planner.next_start_timestamp.as_ref(),
                         );
-                        if let Some(value) = planner.r#override.as_ref() {
-                            if data.planner.r#override.as_ref().map(|item| &item.action)
+                        if let Some(value) = planner.r#override.as_ref()
+                            && data.planner.r#override.as_ref().map(|item| &item.action)
                                 != Some(&value.action)
-                            {
-                                data.planner.r#override =
-                                    Some(schemas::automower::PlannerOverride {
-                                        action: value.action.clone(),
-                                    });
-                                changed = true;
-                            }
+                        {
+                            data.planner.r#override = Some(schemas::automower::PlannerOverride {
+                                action: value.action.clone(),
+                            });
+                            changed = true;
                         }
                         changed |= replace_some(
                             &mut data.planner.restricted_reason,

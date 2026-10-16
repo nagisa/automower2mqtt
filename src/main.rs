@@ -86,10 +86,10 @@ impl std::str::FromStr for ExternalInhibit {
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         let (name, rest) = value
             .split_once('=')
-            .ok_or_else(|| "expected NAME=REASON:DURATION")?;
+            .ok_or("expected NAME=REASON:DURATION")?;
         let (reason, duration) = rest
             .split_once(':')
-            .ok_or_else(|| "expected NAME=REASON:DURATION")?;
+            .ok_or("expected NAME=REASON:DURATION")?;
         let name = HomieID::from_str(&format!("external-inhibit-{name}"))
             .map_err(|_| "invalid inhibit name for a property")?;
         let reason = reason
@@ -214,6 +214,7 @@ fn print_error(e: &dyn std::error::Error) {
     }
 }
 
+#[expect(clippy::result_large_err)]
 fn setup_and_run(args: Args) -> Result<(), Error> {
     tracing_subscriber::registry()
         .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
@@ -1493,12 +1494,11 @@ fn homie_property_value(
             let inhibit = external_inhibits
                 .iter()
                 .find(|inhibit| inhibit.name.as_str() == prop_id)?;
-            Some(
-                (data.planner.external_reason == Some(inhibit.reason))
-                    .then_some("enable")
-                    .unwrap_or("disable")
-                    .to_owned(),
-            )
+            Some(if data.planner.external_reason == Some(inhibit.reason) {
+                "enable".to_owned()
+            } else {
+                "disable".to_owned()
+            })
         }
         ("settings", "cutting-height") => data
             .settings
