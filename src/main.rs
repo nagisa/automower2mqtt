@@ -213,18 +213,65 @@ enum Error {
     PropertyTaskStopped(String, String, String),
 }
 
+/// An error with its sources, as `error: source: source`. Logged as a plain `dyn Error`, journald
+/// would only get the error's own message.
+struct Chain<'a>(&'a dyn std::error::Error);
+
+impl std::fmt::Display for Chain<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)?;
+        let mut source = self.0.source();
+        while let Some(error) = source {
+            write!(f, ": {error}")?;
+            source = error.source();
+        }
+        Ok(())
+    }
+}
+
+/// The journald layer, if stderr is the journal stream systemd connected. Logging through it gives
+/// the lines their real priorities and their fields as journal fields.
+fn journald() -> Option<tracing_journald::Layer> {
+    use std::os::{fd::AsFd as _, unix::fs::MetadataExt as _};
+    // Children inherit `JOURNAL_STREAM`, so it only counts if it is stderr's device and inode.
+    let stream = std::env::var("JOURNAL_STREAM").ok()?;
+    let stderr = std::fs::File::from(std::io::stderr().as_fd().try_clone_to_owned().ok()?);
+    let stderr = stderr.metadata().ok()?;
+    if stream != format!("{}:{}", stderr.dev(), stderr.ino()) {
+        return None;
+    }
+    let priorities = tracing_journald::PriorityMappings {
+        info: tracing_journald::Priority::Informational,
+        debug: tracing_journald::Priority::Debug,
+        ..tracing_journald::PriorityMappings::new()
+    };
+    Some(
+        tracing_journald::layer()
+            .ok()?
+            .with_priority_mappings(priorities),
+    )
+}
+
 fn main() {
     let args = Args::parse();
-    std::process::exit(match setup_and_run(args) {
+    let journald = journald();
+    let to_journal = journald.is_some();
+    std::process::exit(match setup_and_run(args, journald) {
         Ok(_) => 0,
         Err(e) => {
-            print_error(&e);
+            print_error(&e, to_journal);
             1
         }
     });
 }
 
-fn print_error(e: &dyn std::error::Error) {
+fn print_error(e: &dyn std::error::Error, to_journal: bool) {
+    if to_journal {
+        // One line, which journald stores at error priority because of the `<3>`, whatever the log
+        // filter.
+        eprintln!("<3>error: {}", Chain(e));
+        return;
+    }
     eprintln!("error: {e}");
     let mut cause = e.source();
     while let Some(e) = cause {
@@ -234,9 +281,13 @@ fn print_error(e: &dyn std::error::Error) {
 }
 
 #[expect(clippy::result_large_err)]
-fn setup_and_run(args: Args) -> Result<(), Error> {
+fn setup_and_run(args: Args, journald: Option<tracing_journald::Layer>) -> Result<(), Error> {
+    let stderr = journald
+        .is_none()
+        .then(|| tracing_subscriber::fmt::layer().with_writer(std::io::stderr));
     tracing_subscriber::registry()
-        .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
+        .with(journald)
+        .with(stderr)
         .with(args.log_filter.clone())
         .init();
     tracing::debug!(filter = ?args.log_filter, message = "logging initiated");
@@ -538,7 +589,7 @@ impl PropertyTask {
             };
             if let Err(error) = result {
                 tracing::error!(
-                    error = &error as &dyn std::error::Error,
+                    error = %Chain(&error),
                     node_id = %self.node_id,
                     prop_id = %self.prop_id,
                     "error in Homie property task"
@@ -615,7 +666,7 @@ impl PropertyTask {
             self.pending_target = previous;
             if let Err(error) = self.reject().await {
                 tracing::error!(
-                    error = &error as &dyn std::error::Error,
+                    error = %Chain(&error),
                     node_id = %self.node_id,
                     prop_id = %self.prop_id,
                     "could not publish the rejection of a command"
