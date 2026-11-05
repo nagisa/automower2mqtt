@@ -42,6 +42,11 @@
                     default = { };
                     type = types.listOf types.str;
                 };
+                logFilter = mkOption {
+                    description = ''Logging filter for thermia2mqtt service'';
+                    type = types.str;
+                    default = "warn";
+                };
             };
 
             config = mkIf cfg.enable {
@@ -51,6 +56,9 @@
                     wants = [ "network.target" ];
                     wantedBy = [ "multi-user.target" ];
                     unitConfig.StartLimitIntervalSec = "0s";
+                    environment = {
+                        AUTOMOWER2MQTT_LOG = cfg.logFilter;
+                    };
                     serviceConfig = {
                         Restart = "always";
                         RestartSec = 5;
